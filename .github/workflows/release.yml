@@ -1,0 +1,87 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.system }})
+    strategy:
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-24.04
+            checks: package clippy format installer vm
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+            # GitHub's arm runners lack KVM, so the VM check runs on x86_64 only.
+            checks: package clippy format installer
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          extra_nix_config: system-features = nixos-test benchmark big-parallel kvm
+      - name: Run checks
+        run: |
+          for check in ${{ matrix.checks }}; do
+            nix build --print-build-logs ".#checks.${{ matrix.system }}.$check"
+          done
+      - run: nix build --print-build-logs .#static
+      - run: install -m 755 result/bin/waywarp waywarp-${{ matrix.system }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: waywarp-${{ matrix.system }}
+          path: waywarp-${{ matrix.system }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          pattern: waywarp-*
+          merge-multiple: true
+      - name: Check the tag against Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          test "${GITHUB_REF_NAME}" = "v${version}" || {
+            echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${version}"
+            exit 1
+          }
+      - run: cd dist && sha256sum waywarp-* > SHA256SUMS
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/waywarp-*
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The changelog section for this version, without its heading.
+          version=${GITHUB_REF_NAME#v}
+          awk -v heading="## ${version}" '
+            $0 == heading { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          test -s notes.md || {
+            echo "::error::CHANGELOG.md has no section for ${version}"
+            exit 1
+          }
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --title "Waywarp ${version}" \
+            --notes-file notes.md \
+            --verify-tag

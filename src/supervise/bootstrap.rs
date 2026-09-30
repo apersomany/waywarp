@@ -118,10 +118,14 @@ fn connect(supervisor: &Supervisor, route: &Route) -> Result<Locations> {
     let proxy = supervisor.proxy();
     supervisor.private.run(|| {
         dataplane.block();
-        warp::disconnect(monitor)?;
-        dataplane.open(route.clone());
-        warp::connect(monitor, proxy, CONNECT)
+        warp::disconnect(monitor)
     })?;
+    // Authenticate on the host before WARP starts its short connection checks. Mudfish's
+    // pacing wait must not consume the daemon's QUIC/Happy Eyeballs handshake deadline.
+    dataplane.open(route.clone(), supervisor.plan.edge)?;
+    supervisor
+        .private
+        .run(|| warp::connect(monitor, proxy, CONNECT))?;
     if let Route::Relay(_) = route {
         migrate(supervisor)?;
     }

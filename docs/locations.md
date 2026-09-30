@@ -1,6 +1,6 @@
 # Location fields
 
-Waywarp reports several locations because Cloudflare can use different places for the tunnel, the public IP identity, and individual network paths. The [README](../README.md#regions) covers basic use.
+Waywarp reports several locations because Cloudflare can use different places for the tunnel, the public IP identity, and individual network paths. The [regions guide](regions.md) covers basic use.
 
 ## Fields
 
@@ -8,7 +8,7 @@ Waywarp reports several locations because Cloudflare can use different places fo
 
 The advertised places of the WARP IPv4 and IPv6 addresses: a country and, usually, a city. This is what most websites using IP geolocation see.
 
-Waywarp looks the addresses up in Cloudflare's [IP geofeed](https://api.cloudflare.com/local-ip-ranges.csv). Places are not colos. The geofeed names thousands of places, far more than Cloudflare has colos, and an address served from NRT may be advertised as Tokyo, Narita, or Okubo-naka. Each family has its own address, so `geo4` and `geo6` can differ.
+Waywarp looks the addresses up in Cloudflare's [IP geofeed](https://api.cloudflare.com/local-ip-ranges.csv). Places are not colos. The geofeed names thousands of places, far more than Cloudflare has colos; an address's advertised city need not match the city associated with its tunnel's colo. Each family has its own address, so `geo4` and `geo6` can differ.
 
 ### `edge`
 
@@ -25,9 +25,9 @@ A probe does not prove that all destinations use the same exit. Cloudflare can r
 `--location` joins `field=VALUE` terms with `+`, and every term must match. Field names and values ignore case:
 
 ```sh
-waywarp up proxy --location geo4=JP
-waywarp up proxy --location geo4=JP+geo6=JP+edge=NRT
-waywarp up proxy --location 'geo4=JP/Tokyo+probe4=KIX+probe6=NRT'
+waywarp up proxy --location geo4=HK
+waywarp up proxy --location geo4=HK+geo6=HK+edge=HKG
+waywarp up proxy --location 'geo4=HK+probe4=HKG+probe6=HKG'
 ```
 
 `geo4` and `geo6` take a country code, which matches every city in it, or `COUNTRY/City`. Cities compare like Mudfish filters, ignoring case, spaces, and punctuation, so `US/losangeles` matches Los Angeles. `edge`, `probe4`, and `probe6` take a colo code.

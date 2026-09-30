@@ -1,4 +1,6 @@
 // Bridge access: a dual-stack veth pair between the host and the private WARP namespace.
+pub mod nat;
+
 use crate::tool;
 use crate::warp::LINK;
 use anyhow::{Context, Result, bail};
@@ -13,6 +15,10 @@ use std::path::Path;
 const VETH: &str = "veth";
 const WARP_TABLE: u32 = 79;
 const HOST_TABLE: u32 = 80;
+// On the host, sockets bound to a bridge link look up a per-index table whose default route leads
+// into WARP. Only locally originated traffic matches `oif`, so forwarding is unaffected.
+const LINK_TABLE: u32 = 0x7761_7700;
+const LINK_RULE: u32 = 32000;
 const DERIVED4: Ipv4Addr = Ipv4Addr::new(169, 254, 1, 0);
 const DERIVED6: Ipv6Addr = Ipv6Addr::new(0xfd77, 0x6179, 0x7761, 0x7270, 0, 0, 0, 0);
 
@@ -129,14 +135,35 @@ impl fmt::Display for Subnets {
     }
 }
 
-// Runs on the host: creates the host link and moves its peer into the private namespace.
-pub fn attach(link: &str, subnets: Subnets, private: &Path) -> Result<()> {
+// Owns host resources even if a later setup step fails.
+pub struct Attachment {
+    link: String,
+    table: u32,
+}
+
+impl Attachment {
+    pub fn set_mtu(&self, mtu: u32) -> Result<()> {
+        set_mtu(&self.link, mtu)
+    }
+}
+
+impl Drop for Attachment {
+    fn drop(&mut self) {
+        detach_rules(&self.link, self.table);
+        let _ = tool::run("ip", &["link", "delete", &self.link]);
+    }
+}
+
+// Runs on the host: creates the link and moves its peer into the private namespace.
+pub fn attach(index: u8, subnets: Subnets, private: &Path) -> Result<Attachment> {
+    let link = link(index);
+    let table = link_table(index);
     tool::run(
         "ip",
         &[
             "link",
             "add",
-            link,
+            &link,
             "type",
             "veth",
             "peer",
@@ -147,6 +174,10 @@ pub fn attach(link: &str, subnets: Subnets, private: &Path) -> Result<()> {
         ],
     )
     .with_context(|| format!("creating host link {link}"))?;
+    let attachment = Attachment {
+        link: link.clone(),
+        table,
+    };
     tool::ip(
         "-4",
         &format!("address add {}/30 dev {link}", subnets.v4().host),
@@ -158,31 +189,74 @@ pub fn attach(link: &str, subnets: Subnets, private: &Path) -> Result<()> {
             link set {link} up",
             subnets.v6().host
         ),
-    )
+    )?;
+    // Programs bound to the link, such as `ping -I waywarp0`, reach WARP without host routes.
+    detach_rules(&link, table);
+    for (family, gateway) in [
+        ("-4", subnets.v4().gateway.to_string()),
+        ("-6", subnets.v6().gateway.to_string()),
+    ] {
+        tool::ip(
+            family,
+            &format!(
+                "route replace default via {gateway} dev {link} table {table}
+                rule add pref {LINK_RULE} oif {link} lookup {table}"
+            ),
+        )?;
+    }
+    Ok(attachment)
 }
 
-// Runs inside the namespace: both families and directions pass between the host and WARP. NAT
-// presents WARP's addresses externally and maps traffic addressed to them onto the host link.
+// Runs on the host: removes the link's policy rules, including any left by an instance that was
+// killed. The link's routes go away with the link itself.
+fn detach_rules(link: &str, table: u32) {
+    for family in ["-4", "-6"] {
+        let rule = [
+            family,
+            "rule",
+            "del",
+            "pref",
+            &LINK_RULE.to_string(),
+            "oif",
+            link,
+            "lookup",
+            &table.to_string(),
+        ];
+        while tool::run("ip", &rule).is_ok() {}
+    }
+}
+
+// The host policy table for sockets bound to instance `index`'s link.
+fn link_table(index: u8) -> u32 {
+    LINK_TABLE + u32::from(index)
+}
+
+// Runs inside the namespace: both families and directions pass between the host and WARP.
+// Unsolicited traffic for WARP's addresses maps onto the host link. Source NAT starts blocked
+// until the assigned addresses and routed subnets are verified after bootstrap.
+// WARP's link has a smaller MTU than the host's networks, and warp-svc's routes send too-big
+// replies away from the host, so TCP handshakes are clamped to the route MTU both ways.
 pub fn firewall(subnets: Subnets) -> Result<()> {
     let (v4, v6) = (subnets.v4(), subnets.v6());
     tool::nft(&format!(
         "table inet waywarp {{
             chain prerouting {{
                 type nat hook prerouting priority dstnat;
-                meta nfproto ipv4 iifname \"{LINK}\" fib daddr type local dnat ip to {}
-                meta nfproto ipv6 iifname \"{LINK}\" fib daddr type local dnat ip6 to {}
             }}
             chain forward {{
                 type filter hook forward priority filter; policy drop;
                 iifname \"{VETH}\" oifname \"{LINK}\" accept
                 iifname \"{LINK}\" oifname \"{VETH}\" accept
             }}
+            chain clamp {{
+                type filter hook forward priority mangle;
+                tcp flags syn / syn,rst tcp option maxseg size set rt mtu
+            }}
             chain postrouting {{
                 type nat hook postrouting priority srcnat;
-                iifname \"{VETH}\" oifname \"{LINK}\" masquerade
+                iifname \"{VETH}\" oifname \"{LINK}\" drop
             }}
-        }}",
-        v4.host, v6.host
+        }}"
     ))
     .context("loading the bridge firewall")?;
     for (family, gateway) in [
@@ -199,27 +273,80 @@ pub fn firewall(subnets: Subnets) -> Result<()> {
         )?;
     }
     tool::ip("-4", &format!("link set {VETH} up"))?;
+    // WARP ingress returns to the host. Neither the route nor the rule refers to WARP's link by
+    // index, so both outlive the link that warp-svc recreates when it reconnects.
+    for (family, host) in [("-4", v4.host.to_string()), ("-6", v6.host.to_string())] {
+        tool::ip(
+            family,
+            &format!(
+                "route add default via {host} dev {VETH} table {HOST_TABLE}
+                rule add pref 101 iif {LINK} lookup {HOST_TABLE}"
+            ),
+        )?;
+    }
     fs::write("/proc/sys/net/ipv4/ip_forward", "1")?;
     fs::write("/proc/sys/net/ipv6/conf/all/forwarding", "1")?;
     Ok(())
 }
 
-// Runs inside the namespace once WARP is up, opening both directions between WARP and the host.
-pub fn route(subnets: Subnets) -> Result<()> {
-    for (family, host) in [
-        ("-4", subnets.v4().host.to_string()),
-        ("-6", subnets.v6().host.to_string()),
-    ] {
+// Runs inside the namespace whenever WARP is up at the required locations, sending host traffic
+// into WARP. warp-svc recreates its link when it reconnects, and the kernel drops routes through
+// the old one, so this repeats after every reconnect; `replace` makes repeating it harmless.
+fn route() -> Result<()> {
+    for family in ["-4", "-6"] {
         tool::ip(
             family,
-            &format!(
-                "route replace default dev {LINK} table {WARP_TABLE}
-                route replace default via {host} dev {VETH} table {HOST_TABLE}
-                rule add pref 101 iif {LINK} lookup {HOST_TABLE}"
-            ),
+            &format!("route replace default dev {LINK} table {WARP_TABLE}"),
         )?;
     }
     Ok(())
+}
+
+// One snapshot supplies both MTU and assigned-address verification during reconciliation.
+pub struct WarpLink {
+    pub mtu: u32,
+    pub addresses: Vec<IpAddr>,
+}
+
+impl WarpLink {
+    pub fn read() -> Result<Self> {
+        Self::parse(&tool::run("ip", &["-j", "address", "show", "dev", LINK])?)
+    }
+
+    fn parse(contents: &str) -> Result<Self> {
+        #[derive(Deserialize)]
+        struct Link {
+            mtu: u32,
+            #[serde(default)]
+            addr_info: Vec<Address>,
+        }
+        #[derive(Deserialize)]
+        struct Address {
+            local: IpAddr,
+        }
+        let link = serde_json::from_str::<Vec<Link>>(contents)?
+            .into_iter()
+            .next()
+            .context("WARP's link is absent")?;
+        Ok(Self {
+            mtu: link.mtu,
+            addresses: link
+                .addr_info
+                .into_iter()
+                .map(|address| address.local)
+                .collect(),
+        })
+    }
+
+    pub fn reconcile(&self) -> Result<()> {
+        route()?;
+        set_mtu(VETH, self.mtu)
+    }
+}
+
+fn set_mtu(link: &str, mtu: u32) -> Result<()> {
+    tool::ip("-4", &format!("link set dev {link} mtu {mtu}"))
+        .with_context(|| format!("setting the MTU of {link} to {mtu}"))
 }
 
 #[cfg(test)]
@@ -236,6 +363,31 @@ mod tests {
         assert_eq!(last.v6.to_string(), "fd77:6179:7761:7270::3fc/126");
         let second = Subnets::new(1, None, None);
         assert!(!first.v4.contains(&second.v4) && !first.v6.contains(&second.v6));
+    }
+
+    #[test]
+    fn warp_link_snapshot_is_typed_and_requires_a_link() {
+        let snapshot = WarpLink::parse(
+            r#"[{"mtu":1280,"addr_info":[{"local":"172.16.0.2"},{"local":"2001:db8::2"}]}]"#,
+        )
+        .unwrap();
+        assert_eq!(snapshot.mtu, 1280);
+        assert_eq!(
+            snapshot.addresses,
+            [
+                "172.16.0.2".parse::<IpAddr>().unwrap(),
+                "2001:db8::2".parse().unwrap()
+            ]
+        );
+        assert!(WarpLink::parse("[]").is_err());
+        assert!(WarpLink::parse(r#"[{"mtu":null}]"#).is_err());
+        assert!(WarpLink::parse(r#"[{"mtu":1280,"addr_info":[{"local":"invalid"}]}]"#).is_err());
+        assert!(
+            WarpLink::parse(r#"[{"mtu":1280}]"#)
+                .unwrap()
+                .addresses
+                .is_empty()
+        );
     }
 
     #[test]

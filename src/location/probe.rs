@@ -39,8 +39,7 @@ pub fn probe(family: Family, proxy: Option<SocketAddr>) -> Result<Probe> {
         proxy,
         ..Request::new(URL, 16 * 1024)
     }
-    .get()
-    .context("location probe failed")?;
+    .get()?;
     let probe = parse(&String::from_utf8(body)?)?;
     if probe.address.is_ipv6() != (family == Family::V6) {
         bail!("the {family:?} location probe returned {}", probe.address);

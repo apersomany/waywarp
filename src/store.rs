@@ -119,6 +119,11 @@ impl Store {
         })
     }
 
+    pub fn mudfish_auth_limit(&self) -> Result<PathBuf> {
+        private_directory(&self.runtime)?;
+        Ok(self.runtime.join("mudfish-auth"))
+    }
+
     pub fn instance(&self, index: u8) -> Instance {
         Instance {
             index,

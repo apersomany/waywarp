@@ -118,11 +118,31 @@ pub fn isolate(instance: &Instance) -> Result<()> {
     for (source, target) in mounts {
         bind(&source, Path::new(target))?;
     }
+    hide_nscd()?;
     provide_sbin(instance)
 }
 
-// Runs inside the private namespace: sends locally originated TCP to the returned listener, whose
-// connections the data plane forwards out of the physical interface.
+// glibc hands name lookups to a running nscd, which resolves them in the host's network
+// namespace. warp-svc must resolve through its own DNS proxy, named in its private resolv.conf, or
+// its connectivity check fails, so an empty directory hides the socket.
+fn hide_nscd() -> Result<()> {
+    let nscd = Path::new("/run/nscd");
+    if !nscd.is_dir() {
+        return Ok(());
+    }
+    mount(
+        Some("tmpfs"),
+        nscd,
+        Some("tmpfs"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+        Some("mode=0755"),
+    )
+    .context("hiding the host's nscd")
+}
+
+// Runs inside the private namespace: redirects TCP routed to the emulated physical uplink.
+// Traffic warp-svc routes through CloudflareWARP must stay in its tunnel, including connector
+// control traffic. The listener's connections are forwarded out of the host's physical interface.
 pub fn redirect_tcp() -> Result<TcpListener> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
     let port = listener.local_addr()?.port();
@@ -130,7 +150,7 @@ pub fn redirect_tcp() -> Result<TcpListener> {
         "table ip waywarp_redirect {{
             chain output {{
                 type nat hook output priority dstnat; policy accept;
-                meta l4proto tcp ip daddr != 127.0.0.0/8 redirect to :{port}
+                oifname \"{TUN}\" meta l4proto tcp ip daddr != 127.0.0.0/8 redirect to :{port}
             }}
         }}"
     ))

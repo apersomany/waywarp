@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The VM check needs KVM, which only the x86_64 runners provide. Every other check, including
+  # the package's unit tests, runs on both systems.
+  check:
+    name: Check (${{ matrix.system }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-24.04
+            checks: package clippy format installer vm
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+            checks: package clippy format installer
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          extra_nix_config: system-features = nixos-test benchmark big-parallel kvm
+      - name: Run checks
+        run: |
+          for check in ${{ matrix.checks }}; do
+            nix build --print-build-logs ".#checks.${{ matrix.system }}.$check"
+          done
+      - run: nix build --print-build-logs .#static

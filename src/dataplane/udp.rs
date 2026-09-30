@@ -3,7 +3,7 @@
 // SOCKS5 relay; `migrate` later moves every flow to its direct socket.
 use super::packet::{self, HEADERS};
 use crate::via::interface::Interface;
-use crate::via::{Route, socks5};
+use crate::via::{Relay, Route, socks5};
 use mio::net::UdpSocket;
 use mio::unix::SourceFd;
 use mio::{Interest, Registry, Token, Waker};
@@ -19,6 +19,8 @@ use tracing::{debug, warn};
 
 pub const MAX_FLOWS: usize = 1024;
 const MAX_PENDING: usize = 64;
+const MAX_QUEUED_PACKETS: usize = 32;
+const MAX_QUEUED_BYTES: usize = 64 * 1024;
 const IDLE: Duration = Duration::from_secs(180);
 // Received payloads start here so IPv4/UDP headers can be written in front without copying.
 const PAYLOAD: usize = HEADERS;
@@ -29,16 +31,74 @@ struct Key {
     destination: SocketAddrV4,
 }
 
-struct Association {
+pub(super) struct Association {
     socket: UdpSocket,
     relay: SocketAddrV4,
     // The relay drops the association when this TCP control connection closes.
     _control: TcpStream,
 }
 
+pub(super) fn prepare(
+    interface: &Interface,
+    relay: &crate::via::Relay,
+) -> anyhow::Result<Association> {
+    let (control, address) = socks5::associate(interface, relay)?;
+    Ok(Association {
+        socket: UdpSocket::from_std(interface.udp(address)?),
+        relay: address,
+        _control: control,
+    })
+}
+
+pub(super) enum Routing {
+    Blocked,
+    Direct,
+    Relayed {
+        relay: Relay,
+        prepared: Option<(SocketAddrV4, Association)>,
+    },
+}
+
+impl Routing {
+    pub fn prepare(
+        interface: &Interface,
+        route: Route,
+        edge: SocketAddrV4,
+    ) -> anyhow::Result<Self> {
+        Ok(match route {
+            Route::Direct => Self::Direct,
+            Route::Relay(relay) => {
+                let association = prepare(interface, &relay)?;
+                Self::Relayed {
+                    relay,
+                    prepared: Some((edge, association)),
+                }
+            }
+        })
+    }
+}
+
+// Preserve Initial packets while authentication is paced; keeping only the latest datagram
+// can strand QUIC's handshake. Drop new arrivals when full, never overwrite the oldest ones.
+#[derive(Default)]
+struct Pending {
+    packets: Vec<Vec<u8>>,
+    bytes: usize,
+}
+
+impl Pending {
+    fn push(&mut self, payload: &[u8]) {
+        if self.packets.len() < MAX_QUEUED_PACKETS && self.bytes + payload.len() <= MAX_QUEUED_BYTES
+        {
+            self.packets.push(payload.to_vec());
+            self.bytes += payload.len();
+        }
+    }
+}
+
 enum Path {
     Direct,
-    Pending(Option<Vec<u8>>),
+    Pending(Pending),
     Relayed(Association),
 }
 
@@ -50,17 +110,12 @@ struct Flow {
     last_used: Instant,
 }
 
-type Associated = (
-    usize,
-    u64,
-    anyhow::Result<(TcpStream, std::net::UdpSocket, SocketAddrV4)>,
-);
+type Associated = (usize, u64, anyhow::Result<Association>);
 
 pub struct Flows {
     tun: File,
     interface: Interface,
-    // Where new flows go; None blocks them until bootstrap chooses a route.
-    route: Option<Route>,
+    routing: Routing,
     slab: Slab<Flow>,
     keys: HashMap<Key, usize>,
     base: usize,
@@ -79,7 +134,7 @@ impl Flows {
         Self {
             tun,
             interface,
-            route: None,
+            routing: Routing::Blocked,
             slab: Slab::new(),
             keys: HashMap::new(),
             base,
@@ -147,7 +202,7 @@ impl Flows {
             generation: self.generation,
             direct,
             path: if pending {
-                Path::Pending(None)
+                Path::Pending(Pending::default())
             } else {
                 Path::Direct
             },
@@ -187,18 +242,25 @@ impl Flows {
             let payload = &self.buffer[datagram.payload];
             match &mut flow.path {
                 Path::Direct => send(&flow.direct, payload, key.destination),
-                Path::Pending(queued) => *queued = Some(payload.to_vec()),
+                Path::Pending(queued) => queued.push(payload),
                 Path::Relayed(association) => relay_send(association, key.destination, payload),
             }
         }
     }
 
     fn open(&mut self, registry: &Registry, key: Key) -> Option<usize> {
-        let relay = match &self.route {
-            None => return None,
-            Some(Route::Direct) => None,
-            Some(Route::Relay(_)) if self.pending >= MAX_PENDING => return None,
-            Some(Route::Relay(relay)) => Some(relay.clone()),
+        let relay = match &self.routing {
+            Routing::Blocked => return None,
+            Routing::Direct => None,
+            Routing::Relayed { relay, prepared } => {
+                let ready = prepared
+                    .as_ref()
+                    .is_some_and(|(destination, _)| *destination == key.destination);
+                if !ready && self.pending >= MAX_PENDING {
+                    return None;
+                }
+                Some(relay.clone())
+            }
         };
         // Resolved per flow, so a new network takes over as soon as WARP reconnects.
         let direct = match self.interface.udp(key.destination) {
@@ -210,13 +272,28 @@ impl Flows {
         };
         let (index, generation) = self.insert(registry, key, direct, relay.is_some())?;
         if let Some(relay) = relay {
+            if let Routing::Relayed { prepared, .. } = &mut self.routing
+                && let Some((_, mut association)) =
+                    prepared.take_if(|(destination, _)| *destination == key.destination)
+            {
+                if let Err(error) = registry.register(
+                    &mut association.socket,
+                    self.token(index, true),
+                    Interest::READABLE,
+                ) {
+                    warn!(%error, "cannot register a prepared UDP association");
+                    self.close(registry, index);
+                    return None;
+                }
+                self.slab[index].path = Path::Relayed(association);
+                return Some(index);
+            }
             self.pending += 1;
             let interface = self.interface.clone();
             let results = self.results.0.clone();
             let waker = Arc::clone(&self.waker);
             std::thread::spawn(move || {
-                let result = socks5::associate(&interface, &relay)
-                    .and_then(|(control, address)| Ok((control, interface.udp(address)?, address)));
+                let result = prepare(&interface, &relay);
                 let _ = results.send((index, generation, result));
                 let _ = waker.wake();
             });
@@ -238,20 +315,15 @@ impl Flows {
             let Path::Pending(queued) = &mut flow.path else {
                 continue;
             };
-            let queued = queued.take();
+            let queued = std::mem::take(queued);
             let key = flow.key;
-            let association = result.and_then(|(control, socket, relay)| {
-                let mut socket = UdpSocket::from_std(socket);
-                registry.register(&mut socket, token, Interest::READABLE)?;
-                Ok(Association {
-                    socket,
-                    relay,
-                    _control: control,
-                })
+            let association = result.and_then(|mut association| {
+                registry.register(&mut association.socket, token, Interest::READABLE)?;
+                Ok(association)
             });
             match association {
                 Ok(association) => {
-                    if let Some(payload) = queued {
+                    for payload in queued.packets {
                         relay_send(&association, key.destination, &payload);
                     }
                     flow.path = Path::Relayed(association);
@@ -268,20 +340,19 @@ impl Flows {
         }
     }
 
-    // Drops every flow so the next packets start over on `route`, or go nowhere without one.
-    pub fn reset(&mut self, registry: &Registry, route: Option<Route>) {
+    pub fn reset(&mut self, registry: &Registry, routing: Routing) {
         let indices: Vec<_> = self.slab.iter().map(|(index, _)| index).collect();
         for index in indices {
             self.close(registry, index);
         }
-        self.route = route;
+        self.routing = routing;
         self.migrated = None;
     }
 
     // Abandons the relay: every flow continues on its direct socket, whose new source address
     // QUIC connection migration accepts, so the edge session and its colo carry over.
     pub fn migrate(&mut self, registry: &Registry, answered: mpsc::Sender<()>) {
-        self.route = Some(Route::Direct);
+        self.routing = Routing::Direct;
         self.migrated = Some(answered);
         for (_, flow) in self.slab.iter_mut() {
             if let Path::Relayed(association) = &mut flow.path {
@@ -379,4 +450,31 @@ fn relay_send(association: &Association, destination: SocketAddrV4, payload: &[u
     frame.extend_from_slice(&socks5::header(destination));
     frame.extend_from_slice(payload);
     send(&association.socket, &frame, association.relay);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_packets_preserve_order_and_initial_packet() {
+        let mut pending = Pending::default();
+        for index in 0..MAX_QUEUED_PACKETS + 5 {
+            pending.push(&[index as u8]);
+        }
+        assert_eq!(pending.packets.len(), MAX_QUEUED_PACKETS);
+        assert_eq!(pending.bytes, MAX_QUEUED_PACKETS);
+        for (index, packet) in pending.packets.iter().enumerate() {
+            assert_eq!(packet, &[index as u8]);
+        }
+    }
+
+    #[test]
+    fn pending_packets_have_a_byte_limit() {
+        let mut pending = Pending::default();
+        pending.push(&vec![1; MAX_QUEUED_BYTES]);
+        pending.push(&[2]);
+        assert_eq!(pending.packets.len(), 1);
+        assert_eq!(pending.bytes, MAX_QUEUED_BYTES);
+    }
 }

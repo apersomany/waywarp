@@ -1,3 +1,4 @@
+mod auth_limit;
 pub mod interface;
 pub mod mudfish;
 pub mod ping;
@@ -14,6 +15,9 @@ use std::str::FromStr;
 pub struct Login {
     pub username: String,
     pub password: String,
+    // Resolved on the host, before a rootless supervisor enters its user namespace.
+    #[serde(default)]
+    pub auth_limit: Option<std::path::PathBuf>,
 }
 
 impl fmt::Debug for Login {
@@ -46,7 +50,11 @@ fn take_login(service: &str, required: bool) -> Result<Option<Login>> {
             if username.len() > 255 || password.len() > 255 {
                 bail!("SOCKS5 credentials are limited to 255 bytes each");
             }
-            Ok(Some(Login { username, password }))
+            Ok(Some(Login {
+                username,
+                password,
+                auth_limit: None,
+            }))
         }
         (None, None) if !required => Ok(None),
         _ => bail!("set both WAYWARP_{service}_USERNAME and WAYWARP_{service}_PASSWORD"),
@@ -57,7 +65,11 @@ impl Credentials {
     pub fn take(via: &[Via]) -> Result<Self> {
         let uses = |kind: fn(&Via) -> bool| via.iter().any(kind);
         let socks5 = take_login("SOCKS5", false)?;
-        let mudfish = take_login("MUDFISH", uses(|via| matches!(via, Via::Mudfish(_))))?;
+        let mut mudfish = take_login("MUDFISH", uses(|via| matches!(via, Via::Mudfish(_))))?;
+        // Mudfish throttles account logins, so every instance in the store shares one pace.
+        if let Some(login) = &mut mudfish {
+            login.auth_limit = Some(crate::store::Store::current()?.mudfish_auth_limit()?);
+        }
         Ok(Self { socks5, mudfish })
     }
 }

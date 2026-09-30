@@ -6,7 +6,7 @@
   outputs =
     { self, nixpkgs }:
     let
-      lib = nixpkgs.lib;
+      inherit (nixpkgs) lib;
       systems = [
         "x86_64-linux"
         "aarch64-linux"
@@ -28,6 +28,8 @@
         default = pkgs.callPackage ./nix/package.nix {
           cloudflare-warp = pkgs.cloudflare-warp.override { headless = true; };
         };
+        # A self-contained binary for release, run with the host's WARP, iproute2, and nftables.
+        static = pkgs.pkgsStatic.callPackage ./nix/package.nix { runtime = [ ]; };
       });
 
       nixosModules.default = import ./nix/module.nix { inherit self; };
@@ -46,6 +48,7 @@
         in
         {
           package = waywarp;
+          installer = pkgs.callPackage ./nix/installer-test.nix { };
           vm = pkgs.testers.runNixOSTest (
             import ./nix/test.nix {
               inherit self;

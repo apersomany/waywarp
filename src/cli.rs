@@ -80,6 +80,13 @@ pub enum Access {
         subnet4: Option<Ipv4Net>,
         #[arg(long, value_parser = crate::bridge::parse6, help = "IPv6 /126 [default: derived from INDEX]")]
         subnet6: Option<Ipv6Net>,
+        #[arg(
+            long,
+            value_enum,
+            default_value = "auto",
+            help = "Source NAT: follow connector routes, always translate, or never translate"
+        )]
+        nat: crate::bridge::nat::Mode,
     },
 }
 
@@ -105,7 +112,7 @@ pub struct Up {
     #[arg(
         long,
         value_name = "CONSTRAINTS",
-        help = "Require locations, as in geo4=JP, geo6=JP/Tokyo, edge=NRT, probe4=KIX, or several joined with +"
+        help = "Require locations, as in geo4=HK, geo6=HK, edge=HKG, probe4=HKG, or several joined with +"
     )]
     pub location: Option<Constraints>,
     #[arg(

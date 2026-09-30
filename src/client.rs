@@ -28,7 +28,10 @@ const DEFAULT_EDGE: Ipv4Addr = Ipv4Addr::new(162, 159, 198, 1);
 fn access(access: &cli::Access, index: u8) -> Result<(Access, Option<TcpListener>)> {
     match *access {
         cli::Access::Bridge {
-            subnet4, subnet6, ..
+            subnet4,
+            subnet6,
+            nat,
+            ..
         } => {
             if !Uid::effective().is_root() {
                 bail!("bridge access requires root privileges; run with sudo");
@@ -39,7 +42,7 @@ fn access(access: &cli::Access, index: u8) -> Result<(Access, Option<TcpListener
             }
             let subnets = Subnets::new(index, subnet4, subnet6);
             subnets.check_routes()?;
-            Ok((Access::Bridge { link, subnets }, None))
+            Ok((Access::Bridge { link, subnets, nat }, None))
         }
         cli::Access::Proxy { listen, .. } => {
             let listen = listen.unwrap_or(SocketAddrV4::new(

@@ -7,6 +7,18 @@ use std::time::Duration;
 
 // Connects to the relay and completes SOCKS5 method negotiation and authentication.
 fn handshake(interface: &Interface, relay: &Relay) -> Result<TcpStream> {
+    let authenticate = || handshake_unpaced(interface, relay);
+    match relay
+        .login
+        .as_ref()
+        .and_then(|login| login.auth_limit.as_deref())
+    {
+        Some(path) => super::auth_limit::run(path, authenticate),
+        None => authenticate(),
+    }
+}
+
+fn handshake_unpaced(interface: &Interface, relay: &Relay) -> Result<TcpStream> {
     let mut control = interface
         .connect(relay.server, Duration::from_secs(5))
         .with_context(|| format!("connecting to SOCKS5 relay {}", relay.label))?;

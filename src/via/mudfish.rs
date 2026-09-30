@@ -77,7 +77,8 @@ impl Term {
     }
 }
 
-// (union of + terms, or every node when there are none) minus (union of - terms)
+// Every positive term must match, and no negative term may match.
+// + joins positive terms with AND; & is an alias. A leading - selects exclusions only.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Filter {
     source: String,
@@ -87,9 +88,8 @@ pub struct Filter {
 
 impl Filter {
     pub fn matches(&self, node: &Node) -> bool {
-        let included =
-            self.include.is_empty() || self.include.iter().any(|term| term.matches(node));
-        included && !self.exclude.iter().any(|term| term.matches(node))
+        self.include.iter().all(|term| term.matches(node))
+            && !self.exclude.iter().any(|term| term.matches(node))
     }
 }
 
@@ -103,28 +103,30 @@ impl FromStr for Filter {
             include: Vec::new(),
             exclude: Vec::new(),
         };
-        // A leading term without a sign counts as +.
+        // A leading term without a sign counts as +. Delimiters set the next term's sign.
         let mut sign = '+';
-        let mut term = String::new();
-        for character in lowered.chars().chain(std::iter::once('+')) {
-            if character == '+' || character == '-' {
-                if !term.is_empty() {
-                    let parsed = Term::parse(&term)?;
-                    if sign == '+' {
-                        &mut filter.include
-                    } else {
-                        &mut filter.exclude
-                    }
-                    .push(parsed);
-                    term.clear();
+        let mut start = 0;
+        for (offset, delimiter) in lowered
+            .char_indices()
+            .filter(|(_, character)| matches!(character, '+' | '-' | '&'))
+            .chain(std::iter::once((lowered.len(), '+')))
+        {
+            let term = &lowered[start..offset];
+            if term.is_empty() {
+                if offset != 0 || delimiter == '&' || lowered.is_empty() {
+                    return Err("empty Mudfish filter term".into());
                 }
-                sign = character;
             } else {
-                term.push(character);
+                let parsed = Term::parse(term)?;
+                if sign == '-' {
+                    &mut filter.exclude
+                } else {
+                    &mut filter.include
+                }
+                .push(parsed);
             }
-        }
-        if filter.include.is_empty() && filter.exclude.is_empty() {
-            return Err("empty Mudfish filter".into());
+            sign = delimiter;
+            start = offset + 1;
         }
         Ok(filter)
     }
@@ -340,7 +342,86 @@ mod tests {
     }
 
     #[test]
-    fn filters_union_includes_and_subtract_excludes() {
+    fn filters_intersect_fields_without_matching_other_cities_or_providers() {
+        for source in ["city=Osaka+provider=Azure", "city=Osaka&provider=Azure"] {
+            let filter: Filter = source.parse().unwrap();
+            assert!(filter.matches(&node("JP Asia (Osaka - Azure 01)", 1)));
+            assert!(filter.matches(&node("JP Asia (Osaka - Azure 02)", 2)));
+            assert!(!filter.matches(&node("JP Asia (Tokyo - Azure 01)", 3)));
+            assert!(!filter.matches(&node("JP Asia (Osaka - Google 1)", 4)));
+            assert_eq!(filter.to_string(), source);
+        }
+    }
+
+    #[test]
+    fn positive_terms_are_anded_and_negative_terms_each_exclude() {
+        let nodes = [
+            node("JP Asia (Osaka - Azure 01)", 1),
+            node("JP Asia (Osaka - Google 1)", 2),
+            node("JP Asia (Tokyo - Azure 01)", 3),
+            node("SG Asia (Singapore - Azure)", 4),
+        ];
+        let matched = |text: &str| -> Vec<u32> {
+            let filter: Filter = text.parse().unwrap();
+            nodes
+                .iter()
+                .filter(|node| filter.matches(node))
+                .map(|node| node.id)
+                .collect()
+        };
+        assert_eq!(matched("country=jp+city=osaka+provider=azure"), [1]);
+        assert_eq!(matched("country=jp+provider=azure-city=osaka"), [3]);
+        assert_eq!(matched("-country=jp+provider=azure"), [4]);
+        assert_eq!(matched("-country=jp-provider=google"), [4]);
+        assert!(matched("city=osaka+city=singapore").is_empty());
+    }
+
+    #[test]
+    fn multiword_names_match_joined_terms() {
+        let hong_kong = node("HK Asia (Hong Kong - Azure 01)", 1);
+        let filter: Filter = "city=hongkong".parse().unwrap();
+        assert!(filter.matches(&hong_kong));
+        assert!(
+            "country=hk-provider=azure"
+                .parse::<Filter>()
+                .unwrap()
+                .matches(&node("HK Asia (Hong Kong - Vultr)", 2))
+        );
+        assert!(
+            !"country=hk-provider=azure"
+                .parse::<Filter>()
+                .unwrap()
+                .matches(&hong_kong)
+        );
+        // A hyphen starts an exclusion, so the joined spelling is required.
+        assert!(
+            !"city=hong-kong"
+                .parse::<Filter>()
+                .unwrap()
+                .matches(&hong_kong)
+        );
+    }
+
+    #[test]
+    fn empty_conjunction_terms_are_rejected() {
+        for filter in [
+            "",
+            "+",
+            "-",
+            "city=osaka+",
+            "city=osaka++provider=azure",
+            "&",
+            "city=osaka&",
+            "&provider=azure",
+            "city=osaka&&provider=azure",
+            "city=osaka&+provider=azure",
+        ] {
+            assert!(filter.parse::<Filter>().is_err(), "accepted {filter}");
+        }
+    }
+
+    #[test]
+    fn filters_require_all_includes_and_subtract_excludes() {
         let nodes = [
             node("JP Asia (Tokyo - Vultr 2)", 1),
             node("JP Asia (Osaka - Azure)", 2),
@@ -356,9 +437,11 @@ mod tests {
                 .collect()
         };
         assert_eq!(matched("Tokyo"), [1, 3]);
-        assert_eq!(matched("tokyo+osaka-azure"), [1]);
+        assert!(matched("tokyo+osaka-azure").is_empty());
+        assert_eq!(matched("country=jp+city=tokyo-provider=azure"), [1]);
         assert_eq!(matched("-country=jp"), [4]);
-        assert_eq!(matched("+id=2+seoul"), [2, 4]);
+        assert_eq!(matched("+id=2+city=osaka"), [2]);
+        assert!(matched("+id=2+seoul").is_empty());
         assert_eq!(matched("vultr2"), [1]);
         assert!("colo=nrt".parse::<Filter>().is_err());
     }

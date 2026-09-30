@@ -6,7 +6,7 @@ mod udp;
 
 use crate::via::Route;
 use crate::via::interface::Interface;
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token, Waker};
 use nix::sys::socket::{SockaddrIn, getsockopt, sockopt::OriginalDst};
@@ -26,7 +26,7 @@ const SPLICES: usize = FLOWS + udp::MAX_FLOWS * 2;
 
 enum Command {
     Block,
-    Open(Route),
+    Open(udp::Routing, mpsc::Sender<()>),
     Migrate(mpsc::Sender<()>),
     Stop,
 }
@@ -44,6 +44,7 @@ pub struct Frontends {
 pub struct Handle {
     commands: mpsc::Sender<Command>,
     waker: Arc<Waker>,
+    interface: Interface,
 }
 
 impl Handle {
@@ -61,9 +62,15 @@ impl Handle {
         self.send(Command::Stop);
     }
 
-    // Drops every flow; new flows follow `route`.
-    pub fn open(&self, route: Route) {
-        self.send(Command::Open(route));
+    // Runs on the host: finish paced authentication before warp-svc's handshake timer starts.
+    // Then wait until the event loop has installed the route and its prepared edge association.
+    pub fn open(&self, route: Route, edge: std::net::SocketAddrV4) -> Result<()> {
+        let routing = udp::Routing::prepare(&self.interface, route, edge)?;
+        let (ready, answer) = mpsc::channel();
+        self.send(Command::Open(routing, ready));
+        answer
+            .recv_timeout(Duration::from_secs(5))
+            .context("waiting for the data plane to install the route")
     }
 
     // Moves every flow to its direct socket and waits until the edge answers on one.
@@ -97,10 +104,15 @@ pub fn start(
     let flows = Flows::new(tun, interface.clone(), Arc::clone(&waker), FLOWS);
     flows.register(poll.registry(), TUN)?;
     let (commands, queue) = mpsc::channel();
+    let physical = interface.clone();
     std::thread::Builder::new()
         .name("dataplane".into())
         .spawn(move || on_stop(run(poll, flows, interface, frontends, &queue)))?;
-    Ok(Handle { commands, waker })
+    Ok(Handle {
+        commands,
+        waker,
+        interface: physical,
+    })
 }
 
 fn listen(poll: &Poll, listener: std::net::TcpListener, token: Token) -> Result<TcpListener> {
@@ -140,8 +152,11 @@ fn run(
                     flows.associations_ready(registry);
                     for command in commands.try_iter() {
                         match command {
-                            Command::Block => flows.reset(registry, None),
-                            Command::Open(route) => flows.reset(registry, Some(route)),
+                            Command::Block => flows.reset(registry, udp::Routing::Blocked),
+                            Command::Open(routing, ready) => {
+                                flows.reset(registry, routing);
+                                let _ = ready.send(());
+                            }
                             Command::Migrate(answered) => flows.migrate(registry, answered),
                             Command::Stop => return Ok(()),
                         }

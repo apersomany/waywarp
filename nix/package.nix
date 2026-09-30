@@ -2,18 +2,18 @@
   lib,
   rustPlatform,
   makeWrapper,
-  cloudflare-warp,
+  cloudflare-warp ? null,
   iproute2,
   nftables,
-}:
-let
-  manifest = (lib.importTOML ../Cargo.toml).package;
-  # Helpers the supervisor runs, including after `waywarp up` exits.
-  runtime = [
+  # Helpers the supervisor runs, including after `waywarp up` exits; empty leaves them to PATH.
+  runtime ? [
     cloudflare-warp
     iproute2
     nftables
-  ];
+  ],
+}:
+let
+  manifest = (lib.importTOML ../Cargo.toml).package;
 in
 rustPlatform.buildRustPackage {
   pname = manifest.name;
@@ -27,8 +27,8 @@ rustPlatform.buildRustPackage {
     ];
   };
   cargoLock.lockFile = ../Cargo.lock;
-  nativeBuildInputs = [ makeWrapper ];
-  postFixup = ''
+  nativeBuildInputs = lib.optional (runtime != [ ]) makeWrapper;
+  postFixup = lib.optionalString (runtime != [ ]) ''
     wrapProgram $out/bin/waywarp --prefix PATH : ${lib.makeBinPath runtime}
   '';
   passthru = { inherit runtime; };

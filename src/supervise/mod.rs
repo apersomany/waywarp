@@ -1,9 +1,9 @@
 // The supervisor owns one instance for its whole life: namespaces, TUN, veth, data plane, and
 // warp-svc all go away with it.
 mod bootstrap;
+mod bridge;
 mod control;
 
-use crate::bridge;
 use crate::dataplane::{self, Frontends};
 use crate::ipc::{Channel, Listener};
 use crate::location::Locations;
@@ -14,6 +14,7 @@ use crate::sandbox::{self, Private};
 use crate::store::Lock;
 use crate::warp::{self, Daemon, Monitor, State};
 use anyhow::{Context, Result, bail};
+use bridge::Bridge;
 use nix::sys::signal::{SigSet, Signal};
 use std::net::TcpListener;
 use std::os::fd::{AsFd, OwnedFd};
@@ -73,7 +74,7 @@ struct Supervisor {
     monitor: Monitor,
     daemon: Mutex<Option<Daemon>>,
     geofeed: Option<Geofeed>,
-    link: Option<String>,
+    bridge: Option<Bridge>,
     status: Mutex<Status>,
 }
 
@@ -85,15 +86,25 @@ impl Supervisor {
     fn status(&self) -> Status {
         let mut status = self.status.lock().unwrap().clone();
         status.state = self.monitor.state();
+        status.nat = self.bridge.as_ref().and_then(Bridge::policy);
         status
+    }
+
+    fn reconcile_bridge(&self) -> Result<()> {
+        match &self.bridge {
+            Some(bridge) => bridge
+                .reconcile()
+                .context("reconciling the bridge with WARP"),
+            None => Ok(()),
+        }
     }
 
     fn shutdown(&self) {
         self.monitor.stop();
         self.dataplane.stop();
         self.daemon.lock().unwrap().take();
-        if let Some(link) = &self.link {
-            let _ = crate::tool::run("ip", &["link", "delete", link]);
+        if let Some(bridge) = &self.bridge {
+            bridge.stop();
         }
     }
 }
@@ -160,6 +171,7 @@ pub fn run(
     reporter.up(&supervisor.status())?;
     drop(reporter);
     let supervisor = Arc::new(supervisor);
+    bridge::watch(&supervisor, &stop)?;
     recheck_on_reconnect(&supervisor, &stop)?;
     control::serve(listener, &supervisor, &stop)?;
     let reason = stopped.recv().unwrap_or(Stop::Requested);
@@ -240,6 +252,7 @@ fn start(
         relay: None,
         matched: true,
         rebootstraps: 0,
+        nat: None,
     };
     let monitor = Monitor::start(&private)?;
     let mut supervisor = Supervisor {
@@ -249,14 +262,10 @@ fn start(
         monitor,
         daemon: Mutex::new(None),
         geofeed,
-        link: None,
+        bridge: None,
         status: Mutex::new(status),
     };
-    if let Access::Bridge { link, subnets } = &supervisor.plan.access {
-        bridge::attach(link, *subnets, supervisor.private.path())?;
-        supervisor.link = Some(link.clone());
-        supervisor.private.run(|| bridge::firewall(*subnets))?;
-    }
+    supervisor.bridge = Bridge::attach(&supervisor.plan, &supervisor.private)?;
     report("starting warp-svc".into());
     let exited = stop.clone();
     let daemon = Daemon::start(&supervisor.private, move |status| {
@@ -266,9 +275,7 @@ fn start(
     let (edge, proxy) = (supervisor.plan.edge, supervisor.proxy());
     supervisor.private.run(|| warp::configure(edge, proxy))?;
     bootstrap::bootstrap(&supervisor, report)?;
-    if let Access::Bridge { subnets, .. } = supervisor.plan.access {
-        supervisor.private.run(|| bridge::route(subnets))?;
-    }
+    supervisor.reconcile_bridge()?;
     Ok(supervisor)
 }
 
@@ -288,7 +295,14 @@ fn recheck_on_reconnect(supervisor: &Arc<Supervisor>, stop: &mpsc::Sender<Stop>)
                 if connected.is_none() {
                     continue;
                 }
-                if let Err(error) = bootstrap::recheck(&supervisor) {
+                // warp-svc recreates its link when it reconnects, removing the bridge route.
+                // Restore it before the recheck, whose location probes can take a while, and
+                // again after it, since a rebootstrap reconnects without raising this wait.
+                let routed = supervisor
+                    .reconcile_bridge()
+                    .and_then(|()| bootstrap::recheck(&supervisor))
+                    .and_then(|()| supervisor.reconcile_bridge());
+                if let Err(error) = routed {
                     let _ = failed.send(Stop::Failed(format!("{error:#}")));
                     return;
                 }

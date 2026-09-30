@@ -38,6 +38,15 @@ let
             description = "Link the host to WARP with a dual-stack veth pair.";
             type = types.submodule {
               options = {
+                nat = mkOption {
+                  type = types.enum [
+                    "auto"
+                    "always"
+                    "never"
+                  ];
+                  default = "auto";
+                  description = "Source NAT: auto follows the live connector routes; always translates all sources; never requires Cloudflare to route every source back.";
+                };
                 subnet4 = mkOption {
                   type = types.nullOr types.str;
                   default = null;
@@ -60,13 +69,13 @@ let
       location = mkOption {
         type = types.nullOr types.str;
         default = null;
-        example = "geo4=JP+edge=NRT";
+        example = "geo4=HK+edge=HKG";
         description = "Required locations, as for `waywarp up --location`.";
       };
       via = mkOption {
         type = types.listOf types.str;
         default = [ ];
-        example = [ "mudfish:city=tokyo" ];
+        example = [ "mudfish:city=hongkong" ];
         description = "Ways to reach the edge, tried in order (defaults to direct).";
       };
       interface = mkOption {
@@ -133,7 +142,8 @@ let
     ++ lib.optional (!instance.rebootstrap) "--no-rebootstrap"
     ++ optional "--listen" (options.listen or null)
     ++ optional "--subnet4" (options.subnet4 or null)
-    ++ optional "--subnet6" (options.subnet6 or null);
+    ++ optional "--subnet6" (options.subnet6 or null)
+    ++ optional "--nat" (options.nat or null);
   names = lib.attrNames settings.instances;
   indices = lib.mapAttrsToList (_: instance: instance.index) settings.instances;
 in
@@ -153,14 +163,14 @@ in
           index = 0;
           access.proxy = { };
         };
-        tokyo = {
+        hong-kong = {
           index = 2;
           access.bridge = { };
-          location = "geo4=JP";
-          via = [ "mudfish:city=tokyo" ];
+          location = "geo4=HK";
+          via = [ "mudfish:city=hongkong" ];
         };
       };
-      description = "Root-owned Waywarp instances. Each attribute name is also the instance name, so `waywarp status tokyo` works.";
+      description = "Root-owned Waywarp instances. Each attribute name is also the instance name, so `waywarp status hong-kong` works.";
     };
   };
 

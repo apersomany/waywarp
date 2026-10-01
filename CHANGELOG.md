@@ -4,6 +4,19 @@ Changes are listed here using [Keep a Changelog](https://keepachangelog.com/en/1
 
 ## Unreleased
 
+## 0.1.1
+
+### Changed
+
+- New WARP registrations require explicit `--accept-tos` consent before setup. Saved and imported registrations can start without it.
+- NixOS instances have an `acceptTos` option, defaulting to `false`.
+- User-issued `warp-cli` commands no longer receive an implicit `--accept-tos` flag.
+
+### Fixed
+
+- Proxy setup through paced relays no longer stalls on underlay DNS queries. Only traffic to the configured WARP edge is relayed, and unrelated UDP replies cannot confirm tunnel migration.
+- The lock-release test tolerates temporary descriptor inheritance while other tests spawn subprocesses.
+
 ## 0.1.0
 
 ### Added

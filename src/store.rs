@@ -405,7 +405,7 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     fn temporary_store(label: &str) -> (PathBuf, Store) {
         let nonce = SystemTime::now()
@@ -456,7 +456,15 @@ mod tests {
         let descriptor = OwnedFd::from(lock);
         assert!(instance.lock().is_err());
         drop(descriptor);
-        assert!(instance.lock().is_ok());
+        // Concurrent test processes can inherit the descriptor between fork and exec.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while instance.lock().is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "lock remained held after release"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

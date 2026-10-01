@@ -54,10 +54,10 @@ Examples of different requirements:
 | `geo4=HK+geo6=HK+edge=HKG` | Both public IP families are advertised as being in Hong Kong, and the tunnel endpoint is HKG |
 | `geo4=HK+probe4=HKG+probe6=HKG` | The IPv4 address is advertised as being in Hong Kong, and both probes are served by HKG |
 
-To use the second requirement:
+To use the second requirement for a new registration, after reviewing [Cloudflare's terms](https://www.cloudflare.com/application/terms/):
 
 ```sh
-waywarp up proxy --location 'geo4=HK+geo6=HK+edge=HKG' --via mudfish:city=hongkong
+waywarp up proxy --accept-tos --location 'geo4=HK+geo6=HK+edge=HKG' --via mudfish:city=hongkong
 ```
 
 `geo4` and `geo6` take a two-letter country code or `COUNTRY/City`. A country matches any city in it. City matching ignores case, spaces, and punctuation, so `US/losangeles` matches Los Angeles. `edge`, `probe4`, and `probe6` take three-letter colo codes.

@@ -12,10 +12,12 @@ Add `waywarp.url = "github:apersomany/waywarp";` to your flake inputs. Pass `inp
   services.waywarp.instances = {
     home = {
       index = 0;
+      acceptTos = true;
       access.proxy = { };
     };
     hong-kong = {
       index = 2;
+      acceptTos = true;
       access.bridge = { };
       location = "geo4=HK";
       via = [ "mudfish:city=hongkong" ];
@@ -24,6 +26,8 @@ Add `waywarp.url = "github:apersomany/waywarp";` to your flake inputs. Pass `inp
   };
 }
 ```
+
+`acceptTos = true` accepts [Cloudflare's WARP Terms of Service](https://www.cloudflare.com/application/terms/) for a new registration. Review them before enabling it. The default is `false`; saved and imported registrations can start without it.
 
 This creates `waywarp-home.service` and `waywarp-hong-kong.service` and installs the `waywarp` command. Use `sudo` to inspect these root-owned instances:
 
@@ -43,6 +47,7 @@ The `index` remains the instance's primary key. Changing an attribute name while
 | Option | Meaning |
 | --- | --- |
 | `index` | Required index from `0` to `255` |
+| `acceptTos` | Accept Cloudflare's WARP terms when creating a registration; defaults to `false` |
 | `access.proxy.listen` | IPv4 loopback listen address; default port is `1080 + index` |
 | `access.bridge.subnet4`, `access.bridge.subnet6` | Override the derived bridge subnets |
 | `access.bridge.nat` | `"auto"` (default), `"always"`, or `"never"`; see [bridge NAT](access.md#firewall-and-nat) |
@@ -75,8 +80,8 @@ If you supply a package built from your own nixpkgs, your unfree policy must all
 
 ## Service behavior
 
-Each service runs the selected access mode with `--foreground`. For example, the proxy service above runs `waywarp up proxy 0 --name home --foreground`.
+Each service runs the selected access mode with `--foreground`. For example, the proxy service above runs `waywarp up proxy 0 --name home --foreground --accept-tos`.
 
 The service reports ready once WARP is connected and its required locations match. Other units can order themselves after it. Logs go to the journal.
 
-Runtime failures restart the service after five seconds. Invalid command-line options exit with code `2`, which the module does not retry. The start timeout is ten minutes, allowing time for paced relay searches; the stop timeout is thirty seconds.
+Runtime failures restart the service after five seconds. Invalid command-line options or missing consent for a new registration exit with code `2`, which the module does not retry. The start timeout is ten minutes, allowing time for paced relay searches; the stop timeout is thirty seconds.

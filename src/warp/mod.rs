@@ -20,6 +20,16 @@ pub fn proxy_address() -> SocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, PROXY_PORT))
 }
 
+pub fn require_consent(accepted: bool) -> Result<()> {
+    if !accepted {
+        bail!(
+            "a new WARP registration requires accepting Cloudflare's Terms of Service: https://www.cloudflare.com/application/terms/; review them and pass --accept-tos to agree, or import an existing registration"
+        );
+    }
+    Ok(())
+}
+
+// Internal commands run only after explicit acceptance or reuse of an existing registration.
 pub fn cli(arguments: &[&str]) -> Result<String> {
     let arguments: Vec<_> = std::iter::once("--accept-tos")
         .chain(arguments.iter().copied())

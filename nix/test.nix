@@ -20,12 +20,18 @@
         instances = {
           home = {
             index = 0;
+            acceptTos = true;
             access.proxy = { };
           };
           tokyo = {
             index = 2;
+            acceptTos = true;
             access.bridge.subnet4 = "10.9.0.4/30";
             location = "edge=tst";
+          };
+          unaccepted = {
+            index = 4;
+            access.proxy = { };
           };
         };
       };
@@ -34,6 +40,29 @@
   testScript = ''
     machine.wait_for_unit("waywarp-home.service")
     machine.wait_for_unit("waywarp-tokyo.service")
+
+    with subtest("services do not accept terms by default or retry missing consent"):
+        machine.wait_until_succeeds("systemctl show waywarp-unaccepted.service -p ExecMainStatus --value | grep -Fx 2")
+        machine.succeed("systemctl show waywarp-unaccepted.service -p NRestarts --value | grep -Fx 0")
+        machine.succeed("test ! -e /var/lib/waywarp/4")
+
+    with subtest("new registrations require explicit consent before setup"):
+        for mode in ["proxy", "bridge"]:
+            code, output = machine.execute("waywarp up " + mode + " 6 --name declined 2>&1")
+            assert code == 2, output
+            assert "--accept-tos" in output, output
+            assert "https://www.cloudflare.com/application/terms/" in output, output
+        machine.succeed("test ! -e /var/lib/waywarp/6")
+        machine.fail("ip link show waywarp6")
+        machine.succeed("waywarp up proxy 6 --accept-tos")
+        machine.succeed("waywarp down 6")
+        machine.succeed("waywarp up proxy 6")
+        machine.fail("waywarp warp-cli 6 registration new")
+        machine.succeed("waywarp warp-cli 6 --accept-tos registration new")
+        machine.succeed("waywarp down 6")
+        machine.succeed("waywarp import 7 --from /var/lib/waywarp/6/registration")
+        machine.succeed("waywarp up proxy 7")
+        machine.succeed("waywarp down 7")
 
     with subtest("status finds instances by index and name"):
         print(machine.succeed("waywarp status"))
@@ -258,7 +287,7 @@
     with subtest("a bridge that fails to bootstrap removes what it created"):
         # Probes cannot reach Cloudflare in the VM, so probe4 never matches and bootstrap fails
         # after the link, rules, and firewall already exist.
-        machine.fail("waywarp up bridge 5 --location probe4=tst")
+        machine.fail("waywarp up bridge 5 --accept-tos --location probe4=tst")
         machine.fail("ip link show waywarp5")
         machine.succeed("! ip -4 rule show pref 32000 | grep -F waywarp5")
         machine.succeed("! ip -6 rule show pref 32000 | grep -F waywarp5")

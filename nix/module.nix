@@ -21,6 +21,11 @@ let
         type = types.ints.u8;
         description = "Instance index, which derives the proxy port, bridge link, and subnets.";
       };
+      acceptTos = mkOption {
+        type = types.bool;
+        default = false;
+        description = "Accept Cloudflare's WARP Terms of Service (https://www.cloudflare.com/application/terms/) when creating a new registration. Existing and imported registrations do not require this option.";
+      };
       access = mkOption {
         type = types.attrTag {
           proxy = mkOption {
@@ -130,6 +135,7 @@ let
       name
       "--foreground"
     ]
+    ++ lib.optional instance.acceptTos "--accept-tos"
     ++ optional "--location" instance.location
     ++ lib.concatMap (via: [
       "--via"
@@ -161,10 +167,12 @@ in
       example = {
         home = {
           index = 0;
+          acceptTos = true;
           access.proxy = { };
         };
         hong-kong = {
           index = 2;
+          acceptTos = true;
           access.bridge = { };
           location = "geo4=HK";
           via = [ "mudfish:city=hongkong" ];

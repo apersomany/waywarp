@@ -3,8 +3,10 @@
 WARP normally connects near you. To try another region, use `--location` for what you want and `--via` for a way to connect from there:
 
 ```sh
-waywarp up proxy --location geo4=HK --via mudfish:city=hongkong
+waywarp up proxy --accept-tos --location geo4=HK --via mudfish:city=hongkong
 ```
+
+`--accept-tos` accepts [Cloudflare's terms](https://www.cloudflare.com/application/terms/) when creating a new registration. Review them before running the example; an existing registration does not need the flag.
 
 Waywarp connects through a relay, then moves the connection onto your own network. The relay is only needed during setup. The location can carry over, but Waywarp checks the result rather than treating the relay's location as a guarantee.
 
@@ -39,7 +41,7 @@ Waywarp tries entries in order until a connection satisfies the requested locati
 For example, this tries a SOCKS5 relay before searching Mudfish nodes. Replace the example relay address with your own:
 
 ```sh
-waywarp up proxy --location geo4=HK+edge=HKG --via socks5:192.0.2.1:1080 --via mudfish:hongkong
+waywarp up proxy --accept-tos --location geo4=HK+edge=HKG --via socks5:192.0.2.1:1080 --via mudfish:hongkong
 ```
 
 A relay is not kept as a permanent fallback path. After a successful setup, traffic goes directly to Cloudflare. Waywarp checks the locations again whenever WARP reconnects. If a required field changes, it repeats setup with the same `--via` entries and a fresh Mudfish node list.

@@ -21,7 +21,7 @@ Waywarp runs the official WARP client inside private namespaces and controls how
 
 ## Processes and locks
 
-`waywarp up` validates its options, locks the instance, and prepares its files. In proxy mode, it binds the host listener before starting setup so an address conflict fails early.
+`waywarp up` validates its options and locks the instance. If there is no saved registration, it requires `--accept-tos` before proceeding with setup. The consent flag is passed to the supervisor and checked again before starting the registration daemon. In proxy mode, it binds the host listener before starting setup so an address conflict fails early.
 
 By default, `up` starts a detached supervisor in a new session using the hidden `__supervise` command. It sends the setup plan over a `SOCK_SEQPACKET` socket pair, along with the open lock and proxy listener descriptors. The supervisor reports progress and the final result over the same channel. If the caller exits or is interrupted before setup finishes, the supervisor exits too, and the kernel releases its resources.
 
@@ -64,7 +64,9 @@ One event loop per instance handles UDP forwarding and TCP connections between t
 
 UDP packets from `warp-svc` arrive on the supervisor's TUN. Each flow gets a host socket bound to the chosen interface. With automatic selection, Waywarp resolves a physical interface through host routing for each new flow. Binding to that interface keeps tunnel traffic out of host VPNs. `--interface` fixes the choice instead.
 
-During relay setup, UDP flows use SOCKS5 associations. After a successful connection, migration switches the flows to their direct sockets and closes the relay associations. The event loop waits for a reply on the direct path before reporting migration complete.
+During relay setup, UDP sent to the configured WARP edge uses SOCKS5 associations. Other underlay UDP, including DNS queries needed to validate proxy mode, stays direct. Relaying those queries would give every DNS flow a separately paced Mudfish login and stall validation.
+
+After a successful connection, migration switches the tunnel flows to their direct sockets and closes the relay associations. Only a reply from the configured WARP edge confirms migration; an unrelated DNS reply does not.
 
 New flows are blocked before a connection path is selected and between attempts. WARP therefore cannot make a new UDP connection over an unintended path.
 

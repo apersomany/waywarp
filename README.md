@@ -50,13 +50,15 @@ Waywarp uses WARP's MASQUE protocol. Tunnel traffic goes through the host's phys
 
 ## Usage
 
-### Local proxies
+Creating a new registration requires accepting [Cloudflare's Terms of Service](https://www.cloudflare.com/application/terms/). After reviewing them, pass `--accept-tos` as shown below. Saved and imported registrations do not require the flag again.
 
-Start two independent clients:
+### Local proxies (rootless)
+
+Start two independent clients as your normal user, without `sudo`:
 
 ```sh
-waywarp up proxy 0 --name personal
-waywarp up proxy 1 --name second
+waywarp up proxy 0 --name personal --accept-tos
+waywarp up proxy 1 --name second --accept-tos
 
 curl -x socks5h://127.0.0.1:1080 https://www.cloudflare.com/cdn-cgi/trace
 curl -x socks5h://127.0.0.1:1081 https://www.cloudflare.com/cdn-cgi/trace
@@ -85,7 +87,7 @@ Stopping keeps the registration and name, but startup options are not saved. Rep
 With a [Mudfish](https://mudfish.net) account, set `WAYWARP_MUDFISH_USERNAME` and `WAYWARP_MUDFISH_PASSWORD` in your environment, then:
 
 ```sh
-waywarp up proxy 2 --name hong-kong --location geo4=HK --via mudfish:city=hongkong
+waywarp up proxy 2 --name hong-kong --accept-tos --location geo4=HK --via mudfish:city=hongkong
 curl -x socks5h://127.0.0.1:1082 https://www.cloudflare.com/cdn-cgi/trace
 waywarp status hong-kong
 waywarp down hong-kong
@@ -98,7 +100,7 @@ A UDP-capable SOCKS5 relay also works with `--via socks5:ADDRESS:PORT`. Broad Mu
 ### A network link
 
 ```sh
-sudo waywarp up bridge
+sudo waywarp up bridge --accept-tos
 sudo curl --interface waywarp0 https://www.cloudflare.com/cdn-cgi/trace
 sudo waywarp down
 ```
@@ -124,7 +126,7 @@ The geofeed describes an IP's advertised location, not necessarily its physical 
 `--location` takes one field, such as `geo4=HK`, or several joined with `+`. Every term must match. To require Hong Kong for both public IP families and HKG for the tunnel endpoint:
 
 ```sh
-waywarp up proxy --location 'geo4=HK+geo6=HK+edge=HKG' --via mudfish:city=hongkong
+waywarp up proxy --accept-tos --location 'geo4=HK+geo6=HK+edge=HKG' --via mudfish:city=hongkong
 ```
 
 `geo4` and `geo6` accept a two-letter country code or `COUNTRY/City`. The other fields accept a three-letter colo code such as `HKG`. A required field that is unavailable fails the check, so only require the address families you need.

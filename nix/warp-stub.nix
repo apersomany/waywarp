@@ -54,6 +54,10 @@ let
           done
           ;;
         *" registration new "*)
+          case "$arguments" in
+            *" --accept-tos "*) ;;
+            *) echo "registration requires --accept-tos" >&2; exit 2 ;;
+          esac
           echo '{}' > /var/lib/cloudflare-warp/reg.json
           echo '{"account":{"account_type":"free"},"endpoints":[],"interface":{"v4":"172.16.0.2","v6":"2001:db8::2"}}' > /var/lib/cloudflare-warp/conf.json
           ;;

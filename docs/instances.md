@@ -7,11 +7,13 @@ Root and each user have separate stores. If you start an instance with `sudo`, u
 ## Names and lifecycle
 
 ```sh
-waywarp up proxy 1 --name home
+waywarp up proxy 1 --name home --accept-tos
 waywarp status home
 waywarp warp-cli home tunnel stats
 waywarp down home
 ```
+
+For a new registration, review [Cloudflare's Terms of Service](https://www.cloudflare.com/application/terms/) and pass `--accept-tos` to agree. Without the flag, startup exits with code `2` before starting a daemon or entering namespaces. Saved and imported registrations do not need the flag again.
 
 A name is an optional alias for an index, not a separate instance. You can use either in later commands. `--name` replaces the saved name without changing the index or registration; the old name then stops resolving.
 
@@ -25,7 +27,7 @@ Stopping an instance keeps its registration and name. Starting it again reuses t
 
 The command exits `1` if any reported instance is disconnected or fails its location requirements. This is useful as a connection health check, but it does not test reachability to every destination. Bridge NAT targets and configuration validity are reported separately.
 
-`waywarp warp-cli INSTANCE ...` runs `warp-cli` against that instance's daemon. `down` stops the instance without deleting its registration or name.
+`waywarp warp-cli INSTANCE ...` runs `warp-cli` against that instance's daemon with your arguments unchanged. If a command requires terms acceptance, pass it explicitly, for example `waywarp warp-cli INSTANCE --accept-tos registration new`. Waywarp does not add the flag to these calls. `down` stops the instance without deleting its registration or name.
 
 ## Service managers
 
@@ -64,8 +66,8 @@ Detached runs write a fresh log for each start:
 Foreground runs log to stderr, which goes to the journal under systemd. Set `WAYWARP_LOG` to change the level for the command and its supervisor. Per-module overrides are also supported:
 
 ```sh
-WAYWARP_LOG=debug waywarp up proxy
-WAYWARP_LOG=info,waywarp::dataplane=trace waywarp up proxy
+WAYWARP_LOG=debug waywarp up proxy --accept-tos
+WAYWARP_LOG=info,waywarp::dataplane=trace waywarp up proxy --accept-tos
 ```
 
 Registrations contain credentials. Do not include their contents in a bug report.

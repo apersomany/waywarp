@@ -59,7 +59,6 @@ fn handle(client: &Channel, supervisor: &Supervisor, stop: &mpsc::Sender<Stop>) 
             let code = supervisor.private.run(|| {
                 let status = tool::helper(
                     std::process::Command::new("warp-cli")
-                        .arg("--accept-tos")
                         .args(arguments)
                         .stdin(Stdio::null())
                         .stdout(stdout)

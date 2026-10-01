@@ -1,6 +1,6 @@
 // Carries the private namespace's UDP out of the physical interface, one host socket per flow so
-// each reply maps back to exactly one private source. While bootstrapping, new flows go through a
-// SOCKS5 relay; `migrate` later moves every flow to its direct socket.
+// each reply maps back to exactly one private source. While bootstrapping, tunnel flows use a
+// SOCKS5 relay and other underlay UDP stays direct; `migrate` moves the tunnel flows to direct sockets.
 use super::packet::{self, HEADERS};
 use crate::via::interface::Interface;
 use crate::via::{Relay, Route, socks5};
@@ -55,7 +55,8 @@ pub(super) enum Routing {
     Direct,
     Relayed {
         relay: Relay,
-        prepared: Option<(SocketAddrV4, Association)>,
+        edge: SocketAddrV4,
+        prepared: Option<Association>,
     },
 }
 
@@ -71,7 +72,8 @@ impl Routing {
                 let association = prepare(interface, &relay)?;
                 Self::Relayed {
                     relay,
-                    prepared: Some((edge, association)),
+                    edge,
+                    prepared: Some(association),
                 }
             }
         })
@@ -126,7 +128,7 @@ pub struct Flows {
     waker: Arc<Waker>,
     last_sweep: Instant,
     // Answered once an edge replies on a direct socket after `migrate`.
-    migrated: Option<mpsc::Sender<()>>,
+    migrated: Option<(SocketAddrV4, mpsc::Sender<()>)>,
 }
 
 impl Flows {
@@ -251,16 +253,17 @@ impl Flows {
     fn open(&mut self, registry: &Registry, key: Key) -> Option<usize> {
         let relay = match &self.routing {
             Routing::Blocked => return None,
-            Routing::Direct => None,
-            Routing::Relayed { relay, prepared } => {
-                let ready = prepared
-                    .as_ref()
-                    .is_some_and(|(destination, _)| *destination == key.destination);
-                if !ready && self.pending >= MAX_PENDING {
+            Routing::Relayed {
+                relay,
+                edge,
+                prepared,
+            } if *edge == key.destination => {
+                if prepared.is_none() && self.pending >= MAX_PENDING {
                     return None;
                 }
                 Some(relay.clone())
             }
+            _ => None,
         };
         // Resolved per flow, so a new network takes over as soon as WARP reconnects.
         let direct = match self.interface.udp(key.destination) {
@@ -273,8 +276,7 @@ impl Flows {
         let (index, generation) = self.insert(registry, key, direct, relay.is_some())?;
         if let Some(relay) = relay {
             if let Routing::Relayed { prepared, .. } = &mut self.routing
-                && let Some((_, mut association)) =
-                    prepared.take_if(|(destination, _)| *destination == key.destination)
+                && let Some(mut association) = prepared.take()
             {
                 if let Err(error) = registry.register(
                     &mut association.socket,
@@ -352,8 +354,10 @@ impl Flows {
     // Abandons the relay: every flow continues on its direct socket, whose new source address
     // QUIC connection migration accepts, so the edge session and its colo carry over.
     pub fn migrate(&mut self, registry: &Registry, answered: mpsc::Sender<()>) {
-        self.routing = Routing::Direct;
-        self.migrated = Some(answered);
+        self.migrated = match std::mem::replace(&mut self.routing, Routing::Direct) {
+            Routing::Relayed { edge, .. } => Some((edge, answered)),
+            _ => None,
+        };
         for (_, flow) in self.slab.iter_mut() {
             if let Path::Relayed(association) = &mut flow.path {
                 let _ = registry.deregister(&mut association.socket);
@@ -398,7 +402,9 @@ impl Flows {
                 }
                 length - socks5::HEADER
             } else {
-                if let Some(answered) = self.migrated.take() {
+                if let Some((_, answered)) =
+                    self.migrated.take_if(|(edge, _)| *edge == key.destination)
+                {
                     let _ = answered.send(());
                 }
                 length
@@ -455,6 +461,68 @@ fn relay_send(association: &Association, destination: SocketAddrV4, payload: &[u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dns_stays_direct_and_cannot_confirm_tunnel_migration() {
+        let poll = mio::Poll::new().unwrap();
+        let waker = Arc::new(Waker::new(poll.registry(), Token(0)).unwrap());
+        let tun = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        let mut flows = Flows::new(tun, Interface::Named("lo".into()), waker, 16);
+        let tunnel = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let resolver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let address = |socket: &std::net::UdpSocket| {
+            SocketAddrV4::new(
+                std::net::Ipv4Addr::LOCALHOST,
+                socket.local_addr().unwrap().port(),
+            )
+        };
+        let edge = address(&tunnel);
+        let source = "10.79.0.2:5000".parse().unwrap();
+        let dns = Key {
+            source,
+            destination: address(&resolver),
+        };
+        assert!(flows.open(poll.registry(), dns).is_none());
+        flows.routing = Routing::Relayed {
+            relay: Relay {
+                label: "test".into(),
+                server: edge,
+                login: None,
+            },
+            edge,
+            prepared: None,
+        };
+        flows.pending = MAX_PENDING;
+        let dns_index = flows.open(poll.registry(), dns).unwrap();
+        assert!(matches!(flows.slab[dns_index].path, Path::Direct));
+        assert_eq!(flows.pending, MAX_PENDING);
+        let tunnel_key = Key {
+            source,
+            destination: edge,
+        };
+        assert!(flows.open(poll.registry(), tunnel_key).is_none());
+        let (answered, answer) = mpsc::channel();
+        flows.migrate(poll.registry(), answered);
+        let reply = |socket: &std::net::UdpSocket, flow: &Flow| {
+            socket
+                .send_to(
+                    b"reply",
+                    ("127.0.0.1", flow.direct.local_addr().unwrap().port()),
+                )
+                .unwrap();
+        };
+        reply(&resolver, &flows.slab[dns_index]);
+        flows.socket_ready(flows.token(dns_index, false));
+        assert!(matches!(answer.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        let tunnel_index = flows.open(poll.registry(), tunnel_key).unwrap();
+        reply(&tunnel, &flows.slab[tunnel_index]);
+        flows.socket_ready(flows.token(tunnel_index, false));
+        assert_eq!(answer.try_recv(), Ok(()));
+    }
 
     #[test]
     fn pending_packets_preserve_order_and_initial_packet() {

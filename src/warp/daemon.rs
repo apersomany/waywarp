@@ -135,7 +135,8 @@ pub fn registered() -> bool {
 }
 
 // Registration needs TCP, which the private namespace cannot reach, so it runs on the host network.
-pub fn register() -> Result<()> {
+pub fn register(accept_tos: bool) -> Result<()> {
+    super::require_consent(accept_tos)?;
     let mut daemon = spawn(true)?;
     let result = wait_ready(|| match daemon.try_wait()? {
         Some(status) => bail!("warp-svc exited during registration ({status})"),
@@ -145,4 +146,17 @@ pub fn register() -> Result<()> {
     terminate(group(&daemon), || !matches!(daemon.try_wait(), Ok(None)));
     let _ = daemon.wait();
     result.context("registering a WARP device").map(drop)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registration_requires_consent_before_starting_a_daemon() {
+        let error = register(false).unwrap_err().to_string();
+        assert!(error.contains("--accept-tos"));
+        assert!(error.contains("https://www.cloudflare.com/application/terms/"));
+        assert!(crate::warp::require_consent(true).is_ok());
+    }
 }

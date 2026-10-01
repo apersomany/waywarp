@@ -8,7 +8,7 @@ use crate::store::{Instance, Lock, Selector, Store};
 use crate::supervise::{self, Reporter};
 use crate::via::interface::Interface;
 use crate::via::{self, Credentials};
-use crate::warp::State;
+use crate::warp::{self, State};
 use anyhow::{Context, Result, bail};
 use nix::unistd::Uid;
 use std::io::IsTerminal;
@@ -66,6 +66,11 @@ pub fn up(requested: cli::Access) -> Result<()> {
     let store = Store::current()?;
     let instance = store.resolve(&common.instance)?;
     let lock = instance.lock()?;
+    if !instance.registration().join("reg.json").try_exists()?
+        && let Err(error) = warp::require_consent(common.accept_tos)
+    {
+        clap::Error::raw(clap::error::ErrorKind::MissingRequiredArgument, error).exit();
+    }
     let (access, listener) = access(&requested, instance.index)?;
     if let Some(name) = &common.name {
         store.assign(&instance, name)?;
@@ -87,6 +92,7 @@ pub fn up(requested: cli::Access) -> Result<()> {
         credentials,
         mudfish_port: common.mudfish_port,
         rebootstrap: !common.no_rebootstrap,
+        accept_tos: common.accept_tos,
     };
     instance.prepare()?;
     if common.foreground {

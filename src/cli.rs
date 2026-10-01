@@ -111,6 +111,11 @@ pub struct Up {
     pub foreground: bool,
     #[arg(
         long,
+        help = "Accept Cloudflare's Terms of Service when creating a WARP registration"
+    )]
+    pub accept_tos: bool,
+    #[arg(
+        long,
         value_name = "CONSTRAINTS",
         help = "Require locations, as in geo4=HK, geo6=HK, edge=HKG, probe4=HKG, or several joined with +"
     )]
@@ -171,11 +176,40 @@ mod tests {
     }
 
     #[test]
+    fn terms_acceptance_is_explicit_in_both_access_modes() {
+        for mode in ["proxy", "bridge"] {
+            for accepted in [false, true] {
+                let mut arguments = vec!["waywarp", "up", mode];
+                if accepted {
+                    arguments.push("--accept-tos");
+                }
+                let Command::Up(access) = Cli::try_parse_from(arguments).unwrap().command else {
+                    panic!("expected up");
+                };
+                assert_eq!(access.common().accept_tos, accepted);
+            }
+        }
+    }
+
+    #[test]
     fn warp_cli_passes_arguments_through() {
         let cli = Cli::try_parse_from(["waywarp", "warp-cli", "1", "--json", "status"]).unwrap();
         let Command::WarpCli { arguments, .. } = cli.command else {
             panic!("expected warp-cli");
         };
         assert_eq!(arguments, ["--json", "status"]);
+        let cli = Cli::try_parse_from([
+            "waywarp",
+            "warp-cli",
+            "1",
+            "--accept-tos",
+            "registration",
+            "new",
+        ])
+        .unwrap();
+        let Command::WarpCli { arguments, .. } = cli.command else {
+            panic!("expected warp-cli");
+        };
+        assert_eq!(arguments, ["--accept-tos", "registration", "new"]);
     }
 }

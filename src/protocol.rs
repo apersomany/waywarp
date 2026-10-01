@@ -47,6 +47,8 @@ pub struct Plan {
     pub credentials: Credentials,
     pub mudfish_port: u16,
     pub rebootstrap: bool,
+    #[serde(default)]
+    pub accept_tos: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

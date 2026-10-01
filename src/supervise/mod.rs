@@ -197,7 +197,7 @@ fn start(
 ) -> Result<Supervisor> {
     if !warp::registered() {
         report("registering a WARP device".into());
-        warp::register()?;
+        warp::register(plan.accept_tos)?;
     }
     let geofeed = match Geofeed::load(&plan.instance.store) {
         Ok(geofeed) => Some(geofeed),

@@ -4,10 +4,12 @@ Bridge access gives the host a network link into a WARP instance. It needs root,
 
 ## Routing
 
+For a new registration, review [Cloudflare's Terms of Service](https://www.cloudflare.com/application/terms/) and pass `--accept-tos` to agree. Saved and imported registrations do not need the flag.
+
 `up bridge` creates `waywarpINDEX`, with an IPv4 `/30` and IPv6 `/126` subnet. The namespace end of the link is the gateway. For index `0`, you can add routes like these:
 
 ```sh
-sudo waywarp up bridge
+sudo waywarp up bridge --accept-tos
 sudo ip route add 203.0.113.0/24 via 169.254.1.1 dev waywarp0
 sudo ip -6 route add 2001:db8:1234::/48 via fd77:6179:7761:7270::1 dev waywarp0
 ```

@@ -1,74 +1,90 @@
 # Regions and relays
 
-WARP normally connects near you. To exit elsewhere, name the location you need with `--location` and how to reach it with `--via`:
+WARP normally connects near you. To try another region, use `--location` for what you want and `--via` for a way to connect from there:
 
 ```sh
 waywarp up proxy --location geo4=HK --via mudfish:city=hongkong
 ```
 
-Waywarp connects WARP through a relay in that region, then migrates the QUIC session onto your own network. The session keeps the location it received, and your traffic no longer passes through the relay.
+Waywarp connects through a relay, then moves the connection onto your own network. The relay is only needed during setup. The location can carry over, but Waywarp checks the result rather than treating the relay's location as a guarantee.
 
 ## Locations
 
-`--location` joins `field=VALUE` terms with `+`; every term must match, ignoring case.
+`--location` accepts `field=VALUE` terms joined with `+`. Every term must match, and matching ignores case.
 
-| Field | Takes | Checks |
+| Field | Accepts | Meaning |
 | --- | --- | --- |
-| `geo4`, `geo6` | A country, or `COUNTRY/City` | Where Cloudflare's geofeed places the WARP IPv4 or IPv6 address |
-| `edge` | A colo | Where the tunnel terminates |
-| `probe4`, `probe6` | A colo | Which colo served a test request over IPv4 or IPv6 |
+| `geo4`, `geo6` | A country code, or `COUNTRY/City` | The advertised location of the public IPv4 or IPv6 source IP |
+| `edge` | A colo code | The tunnel's Cloudflare-side endpoint |
+| `probe4`, `probe6` | A colo code | Likely egress colos for the IPv4 or IPv6 test requests |
 
-`geo4=HK` is usually what you want: it is what most IP-geolocating websites see. Countries are two-letter codes; colos are Cloudflare's three-letter codes, such as `HKG`. Cities come from Cloudflare's geofeed, so copy them from `status`. [Location fields](locations.md) explains each field and its limits.
+For IP geolocation, start with a requirement such as `geo4=HK`. This checks Cloudflare's advertised location for the public IPv4 address, not the tunnel endpoint or physical exit. Websites using other geolocation databases may disagree.
+
+Countries use two-letter codes. Cloudflare colos (data centers) use three-letter codes, such as `HKG`. City names come from Cloudflare's geofeed; you can copy them from `status`.
+
+See [location fields](locations.md) for what each field means, where its value comes from, and which checks to use. IPv4 and IPv6 can differ, and a probe does not establish the exit for every destination.
 
 ## Vias
 
-`--via` lists ways to reach Cloudflare. Waywarp tries them in order until WARP connects with the required locations, so a relay only has to work once:
+`--via` tells Waywarp how to reach Cloudflare during setup:
 
-| Via | Connects |
+| Value | Connection path |
 | --- | --- |
-| `direct` | From your own network; the default |
-| `socks5:ADDRESS:PORT` | Through a SOCKS5 relay that supports UDP |
-| `mudfish:FILTER` | Through matching Mudfish nodes |
+| `direct` | Your own network; the default when no `--via` is given |
+| `socks5:ADDRESS:PORT` | A SOCKS5 relay with UDP support, at an IPv4 address |
+| `mudfish:FILTER` | Mudfish nodes matching the filter |
 
-Entries can be mixed, and all but `direct` repeated:
+Waywarp tries entries in order until a connection satisfies the requested locations. You can mix types and repeat entries, except that `direct` can appear only once.
+
+For example, this tries a SOCKS5 relay before searching Mudfish nodes. Replace the example relay address with your own:
 
 ```sh
 waywarp up proxy --location geo4=HK+edge=HKG --via socks5:192.0.2.1:1080 --via mudfish:hongkong
 ```
 
-Once connected, the instance keeps its location. Waywarp checks it again whenever WARP reconnects; if it no longer matches, it bootstraps again the same way, with a fresh Mudfish node list. With `--no-rebootstrap`, it keeps the connection and reports the mismatch in `status`, which then exits `1`.
+A relay is not kept as a permanent fallback path. After a successful setup, traffic goes directly to Cloudflare. Waywarp checks the locations again whenever WARP reconnects. If a required field changes, it repeats setup with the same `--via` entries and a fresh Mudfish node list.
+
+With `--no-rebootstrap`, Waywarp keeps the connection even if a required location changes. `status` reports the mismatch and exits `1`.
 
 ## Mudfish
 
-[Mudfish](https://mudfish.net) has UDP-capable SOCKS5 nodes in many regions and charges by traffic. A bootstrap costs little, because only connection setup goes through the relay: one measured bootstrap sent under 100 KiB, including pings of about thirty nodes. Waywarp is not affiliated with Mudfish.
+[Mudfish](https://mudfish.net) offers UDP-capable SOCKS5 nodes in many regions and charges by traffic. Since only setup uses the relay, the traffic cost can be small. One measured setup sent under 100 KiB, including pings of about thirty nodes; that is an example, not a fixed cost. Waywarp is not affiliated with Mudfish.
 
 ### Mudfish filters
 
-Waywarp selects nodes by their location names. Plain words match anywhere; `country`, `region`, `city`, `provider`, and `id` match one field. Every positive term must match: `+` (or `&`) joins terms, and `-` excludes nodes matching the following term. Terms are letters and digits, compared against names without case, spaces, or punctuation, so `city=hongkong` matches Hong Kong. Write `hongkong`, not `hong-kong`: `-` would start an exclusion.
+Filters match node location names. A plain word searches the whole name. `country`, `region`, `city`, `provider`, and `id` select a particular field.
 
-Examples:
+- `+` joins requirements: every positive term must match. `&` means the same thing.
+- `-` excludes nodes matching the next term.
+- Terms contain letters and digits. Matching ignores case, spaces, and punctuation in node names.
 
-```sh
-mudfish:city=hongkong
-mudfish:country=hk-provider=azure
-mudfish:city=hongkong+provider=azure
-```
+For example:
 
-Quote filters containing `&` in a shell. For alternatives, repeat `--via` rather than joining them in one filter.
+| Filter | Selects |
+| --- | --- |
+| `mudfish:city=hongkong` | Nodes in Hong Kong |
+| `mudfish:country=hk-provider=azure` | Nodes in Hong Kong, excluding Azure |
+| `mudfish:city=hongkong+provider=azure` | Azure nodes in Hong Kong |
 
-Waywarp pings matching nodes four at a time and spreads attempts across providers and cities, so one bad provider does not stall the search.
+Write `hongkong`, not `hong-kong`: the hyphen would start an exclusion. Quote filters containing `&` in a shell. To try alternatives, repeat `--via`; joining positive terms in one filter means all of them must match.
+
+Waywarp pings matching nodes four at a time and spreads connection attempts across providers and cities. A failed provider should not use up the whole search before another provider gets a turn.
 
 ### Authentication pacing
 
-Mudfish throttles repeated logins. Waywarp serializes every Mudfish SOCKS5 authentication in a user's store, from relay pings, colo checks, and tunnel flows of every instance, with at least six seconds between exchanges, counting failures. Broad searches can therefore take several minutes. Other programs and other users' stores do not share this limit; `socks5:` vias are not paced.
+Mudfish limits repeated logins. Waywarp allows at least six seconds between SOCKS5 authentication exchanges, including failed ones. All instances in a user's store share this limit, whether a login is for a relay ping, a colo check, or a tunnel flow.
+
+Broad searches can therefore take several minutes. Other programs and other users' stores do not share the limiter. Ordinary `socks5:` entries are not paced.
 
 ## Credentials
 
-Relay credentials come from the environment so they stay out of process listings. Waywarp removes them from its environment before starting any helper:
+Set relay credentials in the environment, not in command-line arguments. Waywarp reads and removes these variables before starting helper processes:
 
-| Variables | For |
+| Variables | Used for |
 | --- | --- |
-| `WAYWARP_MUDFISH_USERNAME`, `WAYWARP_MUDFISH_PASSWORD` | `mudfish:` vias |
-| `WAYWARP_SOCKS5_USERNAME`, `WAYWARP_SOCKS5_PASSWORD` | `socks5:` vias that need a login |
+| `WAYWARP_MUDFISH_USERNAME`, `WAYWARP_MUDFISH_PASSWORD` | `mudfish:` entries |
+| `WAYWARP_SOCKS5_USERNAME`, `WAYWARP_SOCKS5_PASSWORD` | `socks5:` entries that require a login |
 
-Under the NixOS module, provide them through `environmentFile`; see [NixOS](nixos.md).
+For NixOS services, use `environmentFile`; see [NixOS](nixos.md).
+
+For the observations behind relay setup and connection migration, see [WARP routing observations](routing.md).

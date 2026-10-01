@@ -1,41 +1,77 @@
 # Location fields
 
-Waywarp reports several locations because Cloudflare can use different places for the tunnel, the public IP identity, and individual network paths. The [regions guide](regions.md) covers basic use.
+WARP does not have a single location. The tunnel endpoint, the advertised location of a public IP, and the path taken by a request can all differ. IPv4 and IPv6 need not agree either.
+
+Waywarp reports five fields to keep these distinctions visible. This guide explains how to read and request them. See [regions and relays](regions.md) for connection examples, or [routing observations](routing.md) for the experiments and proposed explanation.
 
 ## Fields
 
-### `geo4` and `geo6`
-
-The advertised places of the WARP IPv4 and IPv6 addresses: a country and, usually, a city. This is what most websites using IP geolocation see.
-
-Waywarp looks the addresses up in Cloudflare's [IP geofeed](https://api.cloudflare.com/local-ip-ranges.csv). Places are not colos. The geofeed names thousands of places, far more than Cloudflare has colos; an address's advertised city need not match the city associated with its tunnel's colo. Each family has its own address, so `geo4` and `geo6` can differ.
-
 ### `edge`
 
-The colo where the WARP tunnel terminates. Waywarp reads it from `warp-cli tunnel stats`.
+**Meaning:** the Cloudflare-side endpoint of the WARP tunnel, or its tunnel ingress region. Use it when you care where the tunnel session terminates, rather than where a website places your public IP.
+
+**Source:** the edge colo reported by `warp-cli tunnel stats`.
+
+This is a colo code, such as `HKG`. It does not describe the whole path through Cloudflare or establish where traffic to every destination leaves the network.
+
+### `geo4` and `geo6`
+
+**Meaning:** the country and, when available, city associated with the public source IP for each address family. These describe the connection's IP geolocation identity, not necessarily the physical exit.
+
+**Source:** the public IP returned by each trace probe, looked up in [Cloudflare's IP geofeed](https://api.cloudflare.com/local-ip-ranges.csv).
+
+Use these fields when you want an IPv4 or IPv6 address advertised as belonging to a particular country or city. Websites using other geolocation databases may place the same address elsewhere.
+
+Geofeed places are not colos. Cloudflare advertises more places than it has colos, so an IP's city need not match the city of the tunnel endpoint. Each address family has its own public IP; `geo4` and `geo6` can differ.
 
 ### `probe4` and `probe6`
 
-The colos returned by IPv4 and IPv6 requests to Cloudflare's `/cdn-cgi/trace` endpoint, with the address each request came from. They are likely exit locations for those probe requests.
+**Meaning:** likely egress colos for the IPv4 and IPv6 test requests. These are clues to the traffic path, rather than the IP's advertised location.
 
-A probe does not prove that all destinations use the same exit. Cloudflare can route different address families and destinations differently.
+**Source:** the `colo` and `ip` fields returned by IPv4 and IPv6 requests to `https://engage.cloudflareclient.com/cdn-cgi/trace` through WARP. The probes use pinned addresses to keep each request on its intended address family. Proxy instances probe through WARP's proxy; bridge instances use the namespace's WARP routes.
+
+The reported value includes both the colo and the public source IP. The colo identifies where Cloudflare served that request. Treating it as an egress location is an interpretation, not proof that every destination uses that exit. Cloudflare can route different address families and destinations differently.
+
+## Reading the results
+
+**All five location fields can be different.** That does not, by itself, mean the connection is broken.
+
+- If a website places you in the wrong country, start with `geo4` and `geo6`, then check which address family and geolocation database the website uses.
+- If you want a particular tunnel endpoint, check `edge`.
+- If you are investigating the actual traffic path, compare `probe4` and `probe6` with `edge`. Do not assume the probe path applies to other destinations.
+
+A missing probe leaves that family's probe and geolocation fields unavailable. Missing geofeed data can leave `geo4` and `geo6` unavailable even when the probes succeed.
 
 ## Constraints
 
-`--location` joins `field=VALUE` terms with `+`, and every term must match. Field names and values ignore case:
+`--location` accepts `field=VALUE` terms joined with `+`. Every term must match. Field names and matching values ignore case.
+
+Examples of different requirements:
+
+| Requirement | Meaning |
+| --- | --- |
+| `geo4=HK` | The public IPv4 address is advertised as being in Hong Kong |
+| `geo4=HK+geo6=HK+edge=HKG` | Both public IP families are advertised as being in Hong Kong, and the tunnel endpoint is HKG |
+| `geo4=HK+probe4=HKG+probe6=HKG` | The IPv4 address is advertised as being in Hong Kong, and both probes are served by HKG |
+
+To use the second requirement:
 
 ```sh
-waywarp up proxy --location geo4=HK
-waywarp up proxy --location geo4=HK+geo6=HK+edge=HKG
-waywarp up proxy --location 'geo4=HK+probe4=HKG+probe6=HKG'
+waywarp up proxy --location 'geo4=HK+geo6=HK+edge=HKG' --via mudfish:city=hongkong
 ```
 
-`geo4` and `geo6` take a country code, which matches every city in it, or `COUNTRY/City`. Cities compare like Mudfish filters, ignoring case, spaces, and punctuation, so `US/losangeles` matches Los Angeles. `edge`, `probe4`, and `probe6` take a colo code.
+`geo4` and `geo6` take a two-letter country code or `COUNTRY/City`. A country matches any city in it. City matching ignores case, spaces, and punctuation, so `US/losangeles` matches Los Angeles. `edge`, `probe4`, and `probe6` take three-letter colo codes.
 
-Every field except `edge` names one address family. A family that is unavailable fails any constraint on it, so only require the families you need.
+Each field can appear only once. Use the full family-specific names: `geo` and `probe` are not accepted.
 
-Waywarp checks colos and places against Cloudflare's data before connecting, so a typo fails immediately. It checks the constraints after connection and migration, and after later reconnects. A mismatch triggers the ordered bootstrap again unless `--no-rebootstrap` is set. Unconstrained fields are informational.
+Every field except `edge` refers to one address family. An unavailable field fails a requirement on it, so only require the families you need. Fields you do not constrain are still reported, but do not affect whether the location check passes.
+
+When Cloudflare's location data is available, Waywarp validates country/city values and colo codes before connecting. Unknown values fail early. It checks the actual connection after setup and migration, then again after later reconnects.
+
+If a required field changes, Waywarp repeats setup using the ordered `--via` entries. With `--no-rebootstrap`, it keeps the connection and reports the mismatch instead.
 
 ## Data cache
 
-Waywarp caches Cloudflare's geofeed and colo catalog for 24 hours, shared by every instance in a store. If refresh fails, it uses existing cached data when available. Without a `geo4` or `geo6` constraint, missing data only leaves those fields unavailable.
+Cloudflare's geofeed and colo catalog are cached for 24 hours and shared by instances in the same store. If a refresh fails, Waywarp uses existing cached data when it can.
+
+Without a `geo4` or `geo6` requirement, a failure to load the location data leaves those fields unavailable rather than preventing startup. A geolocation requirement needs that data to be checked, so startup fails if it cannot be loaded.

@@ -1,23 +1,27 @@
 # Changelog
 
-All notable changes to this project are documented in this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Changes are listed here using [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.1.0
+
 ### Added
 
-- Isolated WARP instances identified by index, each with its own registration, daemon, and network namespace, and optionally by a unique name that every command accepts. Instances resolve names through a private DNS proxy, never the host's nscd.
-- Cross-regional exits: WARP bootstraps through a relay in the chosen region, then migrates to the local network and keeps its location.
-- Proxy access for normal users and root, with SOCKS5 and HTTP CONNECT on loopback.
-- Bidirectional dual-stack bridge access for root, with derived IPv4 `/30` and IPv6 `/126` subnets and host-controlled filtering. Sockets bound to the bridge link route into WARP. Routes, MTU, TCP MSS clamping, and NAT are reconciled with WARP's link after every reconnect and registration change.
-- Bridge NAT that follows the live registration: `--nat auto` keeps connector-routed sources untranslated and translates the rest to the device's assigned addresses, with `always` and `never` overrides. Inbound traffic for the assigned addresses reaches the host, while shared connector services such as mesh DNS stay local.
-- Ordered `--via` entries: `direct`, SOCKS5 relays, and filtered Mudfish nodes, expanded afresh for every bootstrap. Mudfish filter terms joined by `+` (or `&`) must all match; `-` excludes.
-- Mudfish authentication paced across every instance in a user's store, with the first relay association prepared before WARP's handshake deadline starts.
-- `--location` constraints on per-family geo places, the edge colo, and per-family probe colos, rechecked after reconnects with automatic rebootstrap.
-- `status` (with `--json`), `down`, and `warp-cli` commands for running instances.
-- Foreground instances with systemd readiness notification.
-- Zero Trust registration import without re-enrollment, automatic Team edge selection, and native TCP forwarding for traffic routed outside the tunnel.
-- Physical interface resolution per flow, following network changes.
-- Structured logging configurable with `WAYWARP_LOG`.
-- Nix flake for x86_64 and aarch64 Linux with the package, a static release build, a NixOS module for named instances, a VM test, and a development shell that provides the runtime tools.
+- Separate WARP clients, each with its own registration, daemon, and network namespace. Indices are primary keys; optional unique names can be used in commands.
+- Private DNS resolution for each client, without using the host's nscd.
+- Regional connection setup through a relay, followed by migration onto the local network and location checks.
+- SOCKS5 and HTTP CONNECT proxies on loopback, for normal users and root.
+- Root-owned IPv4/IPv6 bridge links with derived `/30` and `/126` subnets. Bound sockets use WARP, while the host controls routing and filtering for other traffic.
+- Bridge route, MTU, TCP MSS, and NAT updates after reconnects and registration changes.
+- Bridge NAT that follows connector routes and uses the device's assigned addresses, with `always` and `never` overrides. Incoming traffic for those addresses reaches the host; shared connector services such as mesh DNS stay inside the namespace.
+- Ordered `--via` paths: direct, SOCKS5 relays, and filtered Mudfish nodes. Each setup fetches a fresh Mudfish node list. Positive filter terms joined by `+` or `&` must all match; `-` excludes nodes.
+- Mudfish login pacing shared by instances in a user's store. The first relay association is authenticated before WARP's handshake deadline starts.
+- `--location` requirements for public IP geolocation, the tunnel colo, and IPv4/IPv6 probe colos. Locations are checked after reconnects, with automatic setup repeated when a requirement no longer matches.
+- `status`, including JSON output, plus `down` and per-instance `warp-cli` commands.
+- Foreground runs with systemd readiness notification.
+- Zero Trust registration import without enrolling again, automatic Team edge selection, and direct TCP forwarding for requests routed outside the tunnel.
+- Physical interface selection for each new flow, so new flows follow network changes.
+- Logging levels and module overrides through `WAYWARP_LOG`.
+- A Nix flake for x86_64 and aarch64 Linux, with a package, static release build, NixOS module, VM test, and development shell containing the runtime tools.
 - CI, tagged releases with checksums and build provenance, and an installer script.

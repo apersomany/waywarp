@@ -1,8 +1,10 @@
 # Bridge access and Zero Trust
 
+Bridge access gives the host a network link into a WARP instance. It needs root, but does not make WARP the host's default connection.
+
 ## Routing
 
-`up bridge` needs root. It creates a dual-stack host link, `waywarpINDEX`, with point-to-point IPv4 `/30` and IPv6 `/126` subnets. The namespace side is the gateway:
+`up bridge` creates `waywarpINDEX`, with an IPv4 `/30` and IPv6 `/126` subnet. The namespace end of the link is the gateway. For index `0`, you can add routes like these:
 
 ```sh
 sudo waywarp up bridge
@@ -10,40 +12,54 @@ sudo ip route add 203.0.113.0/24 via 169.254.1.1 dev waywarp0
 sudo ip -6 route add 2001:db8:1234::/48 via fd77:6179:7761:7270::1 dev waywarp0
 ```
 
-Only the link subnets are added automatically, so nothing else uses WARP until you route it. Sockets bound to the link are the exception: a policy rule sends their traffic through WARP, as with `curl --interface waywarp0` or `ping -I waywarp0`. That rule has preference 32000 and looks up table `2002876160+INDEX`.
+The destinations above are examples; replace them with the networks you want to reach through WARP.
 
-Network managers that remove foreign rules and routes, such as systemd-networkd by default, also remove these. Set `ManageForeignRoutingPolicyRules=no` and `ManageForeignRoutes=no` to keep them.
+Waywarp adds the link subnets, but no routes for other destinations. Traffic uses WARP when you add a route or bind a socket to the link:
 
-Each instance derives its own subnets from its index. `--subnet4` and `--subnet6` replace them if either overlaps one of your networks; `up` refuses subnets that overlap an existing host route.
+```sh
+sudo curl --interface waywarp0 https://www.cloudflare.com/cdn-cgi/trace
+sudo ping -I waywarp0 1.1.1.1
+```
 
-The link takes the MTU of WARP's own link, so the host refuses oversized packets itself and tells their senders, and TCP MSS is clamped in both directions. Waywarp keeps the route, MTU, and NAT in step with WARP after every reconnect.
+Bound sockets use a policy rule with preference `32000`, which looks up table `2002876160 + INDEX`.
+
+Network managers can remove rules and routes they did not create. systemd-networkd does this by default. Set `ManageForeignRoutingPolicyRules=no` and `ManageForeignRoutes=no` if you want it to leave Waywarp's rules and routes alone.
+
+Each index gets different default subnets. If they conflict with your network, choose others with `--subnet4` and `--subnet6`. IPv4 subnets must be canonical `/30` networks and IPv6 subnets canonical `/126` networks. `up` rejects subnets that overlap an existing host route.
+
+The bridge uses WARP's MTU, so the host can reject oversized packets and tell their senders. Waywarp also clamps TCP MSS in both directions. Routes, MTU, and NAT are updated after reconnects so they follow WARP's recreated link.
 
 ## Firewall and NAT
 
-The private namespace permits both directions between the host link and WARP. Waywarp never adds host firewall rules or copies connector routes to the host: host routing and host nftables decide what reaches the link.
+Inside the private namespace, traffic is allowed in both directions between the host link and WARP. Waywarp adds no host firewall rules and does not copy connector routes to the host. Your host routes and nftables rules decide what reaches the link.
 
-Outbound source NAT follows `--nat` (`access.bridge.nat` in NixOS):
+Choose outbound source NAT with `--nat`, or `access.bridge.nat` in NixOS:
 
 | Mode | Behavior |
 | --- | --- |
-| `auto` (default) | Sources in the connector's advertised `routes` keep their addresses when `connector_config.nat_mode` is false; everything else is translated |
+| `auto` (default) | Keep sources in the connector's advertised `routes` unchanged when `connector_config.nat_mode` is false; translate everything else |
 | `always` | Translate every source |
-| `never` | Translate nothing; Cloudflare must route every source back to this node |
+| `never` | Leave sources unchanged; Cloudflare must know how to route them back to this node |
 
-Translation always targets the device's assigned `interface.v4` or `interface.v6`, never a shared connector address. Consumer and ordinary Team registrations have no connector routes, so all their traffic is translated.
+When translating, Waywarp uses the device's assigned `interface.v4` or `interface.v6`, not a shared connector address. Consumer and ordinary Team registrations have no connector routes, so `auto` translates all of their outgoing traffic.
 
-Unsolicited traffic for the assigned addresses is forwarded to the host side of the link. Other connector addresses stay in the namespace, so services such as Cloudflare mesh DNS keep working.
+Incoming traffic for those assigned WARP addresses is forwarded to the host side of the link. Other connector addresses stay inside the namespace. That keeps services such as Cloudflare mesh DNS local to the connector.
 
-Waywarp follows the registration live: it watches `conf.json`, reconciles every five seconds and after reconnects, and replaces the NAT rules in one nftables transaction. It fails safe:
+### Registration changes
 
-- A missing or malformed configuration removes routed exemptions, even with `never`, and keeps translating to previously verified addresses.
-- An assigned address absent from WARP's current link blocks new traffic in that family rather than translating it to another address.
+Waywarp watches `conf.json` and checks the bridge every five seconds and after reconnects. Changed NAT rules are applied in one nftables transaction.
 
-Existing connections keep their conntrack mapping, so route removals or address changes may require reconnecting them. `status` shows the mode, routed sources, and whether the configuration is valid; `status --json` also shows the verified targets. Registration contents are never logged.
+If the configuration is missing or malformed, Waywarp removes the routed-source exceptions and falls back to translation using the last verified targets. This also overrides `never` while the configuration is invalid.
+
+A translation target must still be present on WARP's current link. Traffic that needs translation is blocked for an address family with no valid target, rather than being translated to some other address. This does not block sources already exempt from translation, or the `never` path when the configuration is valid.
+
+Existing connections keep their conntrack mappings. If a route or assigned address changes, you may need to reconnect them before the new policy takes effect.
+
+`status` shows the NAT mode, routed sources, and whether the configuration is valid. `status --json` also shows the verified translation targets. Registration contents are never logged.
 
 ## Zero Trust
 
-Copy an existing Cloudflare Zero Trust registration into a root-owned instance without logging in again:
+You can copy an existing Cloudflare Zero Trust registration into a root-owned instance without logging in again:
 
 ```sh
 sudo waywarp import 3
@@ -52,10 +68,14 @@ sudo waywarp up bridge 3
 warp-cli --accept-tos connect
 ```
 
-`import` reads `/var/lib/cloudflare-warp` by default and leaves it unchanged; `--from` names another state directory and `--replace` overwrites an instance's registration. Waywarp recognizes Team registrations, selects their WARP edge, and forwards the direct TCP they need for policy and posture requests.
+Disconnect the original client while the copy makes its first connection. Once `up` succeeds, reconnect the original. Both can then stay connected, although your organization's policy may impose other restrictions.
 
-Disconnect the original client while the copy makes its first connection; reconnect it after `up` succeeds. Both can then stay connected, although an organization's policy may behave differently. Waywarp refreshes its own copy and never writes back to the original.
+`import` reads `/var/lib/cloudflare-warp` by default and leaves the source unchanged. Use `--from` for another state directory, or `--replace` to overwrite the instance's existing registration. Waywarp refreshes its own copy and never writes changes back to the original.
 
-Zero Trust policy controls what access works. If it prohibits mode switching, as many include-only policies do, use bridge access. Enroll with the Cloudflare client first; Waywarp adds no separate enrollment flow.
+Waywarp recognizes Team registrations, chooses their WARP edge, and forwards the direct TCP requests needed for policy and posture checks.
 
-Proxy access has no authentication, so any local user could use an imported identity through it. On shared machines, prefer bridge access for Zero Trust instances.
+### Policy and local access
+
+Your organization's policy still controls what the instance can reach and which modes it can use. If it disallows switching to proxy mode, as many include-only policies do, use bridge access. Enroll through the Cloudflare client first; Waywarp does not provide a separate enrollment flow.
+
+**Proxy access has no authentication.** Any local user could use an imported identity through its proxy. On shared machines, prefer bridge access for Zero Trust instances.

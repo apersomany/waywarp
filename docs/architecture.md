@@ -96,13 +96,13 @@ Other users' stores and external programs do not share this limit. Ordinary `soc
 
 ## Bootstrap
 
-Each setup expands the ordered `--via` entries into connection paths, fetching the Mudfish node list again when needed.
+Each setup expands the ordered `--via` entries only as they are reached. Later providers are not contacted if an earlier entry succeeds; Mudfish node lists are fetched afresh when needed.
 
-1. Consecutive relays are pinged four at a time. A QUIC version negotiation packet tests UDP reachability and measures the reply time. A separate trace request gives a colo hint. Relays that look unlikely to meet the requirements are tried last, not discarded: the hint may be wrong.
+1. Relays within the current entry are pinged four at a time. A QUIC version negotiation packet tests UDP reachability and measures the reply time. A separate trace request gives a colo hint. Relays that look unlikely to meet the requirements are tried last, not discarded: the hint may be wrong.
 2. Each connection attempt starts from a confirmed disconnect. The UDP routing state is blocked, direct, or relayed, so an earlier connection cannot carry over into the next attempt.
 3. For a relay, the supervisor authenticates the first UDP association on the host before starting WARP and hands it to the event loop. This keeps Mudfish's pacing delay outside WARP's short Happy Eyeballs deadline. Later flows waiting for an association retain up to 32 datagrams and 64 KiB in FIFO order. Overflow drops new arrivals rather than replacing the initial QUIC packets.
 4. After WARP connects through a relay, Waywarp switches its UDP flows to direct sockets. WARP may migrate the existing QUIC session or reconnect while the new path settles. The supervisor waits for a connection if that happens.
-5. The supervisor reads the locations from inside the namespace and checks every requirement. A mismatch moves on to the next connection path.
+5. The supervisor reconciles any bridge and reads locations inside the namespace, then checks every requirement. Verification is tied to the current tunnel generation and retried if it changes during a probe. After migration, or when a QUIC session has been observed, at least one tunnel probe must succeed. A location mismatch moves on to the next connection path.
 
 The observations behind location retention are described separately in [WARP routing observations](routing.md).
 
@@ -110,11 +110,15 @@ The observations behind location retention are described separately in [WARP rou
 
 A persistent `warp-cli --listen status` process reports connection changes. Connection waits use those events rather than polling. Daemon startup is polled because `warp-svc` does not announce when its control socket opens.
 
-After a later `Connected` event, the supervisor reads the location fields again. If a required field no longer matches and rebootstrap is enabled, it repeats setup.
+The data plane also observes WARP's QUIC handshakes without decrypting tunnel traffic. New connection attempts and handshake exchanges invalidate prior verification, even when `warp-cli` remains connected or the routing prefix of a connection ID is reused. Path changes, CLI status events, and bridge link events contribute to the same generation.
+
+A background worker rechecks pending generations. Location results are published only when the connection stays healthy and the generation remains unchanged through probing and a quiet interval. A connected tunnel with stale verification is reported as degraded until a current result is published; it cannot inherit healthy status from an earlier connection. If a required field no longer matches and rebootstrap is enabled, the worker repeats setup.
 
 ### Bridge updates
 
-WARP recreates its link on connection, and the kernel removes routes through the old link. The supervisor restores the bridge route after setup and before and after each reconnect check. It also checks the bridge when `conf.json` changes and every five seconds.
+WARP recreates its link on connection, and the kernel removes routes through the old link. The supervisor subscribes to kernel link and IPv4/IPv6 address notifications before starting the daemon. These events trigger bridge reconciliation and fresh tunnel verification even without a CLI reconnect. Lost or malformed event data invalidates the tracked link and forces a fresh snapshot.
+
+The bridge is also reconciled during tunnel verification, when `conf.json` changes, and every five seconds as a fallback. Transient snapshot/update races are retried; persistent reconciliation errors stop the instance.
 
 Each update takes one snapshot of WARP's link and applies the derived changes under one lock:
 
@@ -141,13 +145,14 @@ An instance stops if `warp-svc` exits or the data plane fails. It does not resta
 | `store` | State and runtime directories, names, selectors, and locks |
 | `supervise` | Instance lifecycle, bootstrap, bridge updates, and control socket |
 | `warp` | `warp-cli` commands, daemon management, and status monitoring |
-| `dataplane` | Event loop, UDP flows, TCP forwarding, and packet framing |
+| `dataplane` | Event loop, UDP flows, TCP forwarding, packet framing, and QUIC generation tracking |
 | `via` | Connection paths, interfaces, SOCKS5, Mudfish, and relay pings |
 | `location` | Location requirements, geofeed data, and probes |
 | `sandbox` | Mount and network namespaces, TUN, and TCP redirect |
-| `bridge` | Host link, subnets, firewall, routes, link snapshots, and NAT |
+| `bridge` | Host link, subnets, firewall, routes, kernel link/address notifications, link snapshots, and NAT |
 | `http` | HTTP requests with SOCKS5 and pinned addresses |
 | `tool` | Running `ip`, `nft`, and other helpers |
 | `notify` | systemd readiness notification |
+| `output` | Human status and errors, stdout writes, color and escaping, and tracing console/log formatting |
 | `text` | Text normalization for filters and places |
 | `ipc`, `protocol` | Messages and descriptor passing between client and supervisor |

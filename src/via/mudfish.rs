@@ -342,69 +342,67 @@ mod tests {
     }
 
     #[test]
-    fn filters_intersect_fields_without_matching_other_cities_or_providers() {
-        for source in ["city=Osaka+provider=Azure", "city=Osaka&provider=Azure"] {
-            let filter: Filter = source.parse().unwrap();
-            assert!(filter.matches(&node("JP Asia (Osaka - Azure 01)", 1)));
-            assert!(filter.matches(&node("JP Asia (Osaka - Azure 02)", 2)));
-            assert!(!filter.matches(&node("JP Asia (Tokyo - Azure 01)", 3)));
-            assert!(!filter.matches(&node("JP Asia (Osaka - Google 1)", 4)));
-            assert_eq!(filter.to_string(), source);
-        }
-    }
-
-    #[test]
-    fn positive_terms_are_anded_and_negative_terms_each_exclude() {
+    fn filters_match_table_cases() {
         let nodes = [
             node("JP Asia (Osaka - Azure 01)", 1),
-            node("JP Asia (Osaka - Google 1)", 2),
-            node("JP Asia (Tokyo - Azure 01)", 3),
-            node("SG Asia (Singapore - Azure)", 4),
+            node("JP Asia (Osaka - Azure 02)", 2),
+            node("JP Asia (Osaka - Google 1)", 3),
+            node("JP Asia (Tokyo - Azure 01)", 4),
+            node("JP Asia (Tokyo - Vultr 2)", 5),
+            node("SG Asia (Singapore - Azure)", 6),
+            node("HK Asia (Hong Kong - Azure 01)", 7),
+            node("KR Asia (Seoul - AWS)", 8),
+            node("HK Asia (Hong Kong - Vultr)", 9),
         ];
-        let matched = |text: &str| -> Vec<u32> {
-            let filter: Filter = text.parse().unwrap();
-            nodes
+        let cases = [
+            ("country=jp+city=osaka+provider=azure", vec![1, 2]),
+            ("city=osaka&provider=azure", vec![1, 2]),
+            ("country=jp+provider=azure-city=osaka", vec![4]),
+            ("-country=jp+provider=azure", vec![6, 7]),
+            ("-country=jp-provider=google", vec![6, 7, 8, 9]),
+            ("Tokyo", vec![4, 5]),
+            ("tokyo+osaka-azure", vec![]),
+            ("country=jp+city=tokyo-provider=azure", vec![5]),
+            ("-country=jp", vec![6, 7, 8, 9]),
+            ("+id=2+city=osaka", vec![2]),
+            ("+id=2+seoul", vec![]),
+            ("vultr2", vec![5]),
+            ("city=hongkong", vec![7, 9]),
+            ("country=hk-provider=azure", vec![9]),
+            ("country=hk-provider=vultr", vec![7]),
+            ("city=osaka+city=singapore", vec![]),
+        ];
+        for (source, expected) in cases {
+            let filter: Filter = source.parse().unwrap();
+            let found: Vec<_> = nodes
                 .iter()
                 .filter(|node| filter.matches(node))
                 .map(|node| node.id)
-                .collect()
-        };
-        assert_eq!(matched("country=jp+city=osaka+provider=azure"), [1]);
-        assert_eq!(matched("country=jp+provider=azure-city=osaka"), [3]);
-        assert_eq!(matched("-country=jp+provider=azure"), [4]);
-        assert_eq!(matched("-country=jp-provider=google"), [4]);
-        assert!(matched("city=osaka+city=singapore").is_empty());
-    }
-
-    #[test]
-    fn multiword_names_match_joined_terms() {
-        let hong_kong = node("HK Asia (Hong Kong - Azure 01)", 1);
-        let filter: Filter = "city=hongkong".parse().unwrap();
-        assert!(filter.matches(&hong_kong));
-        assert!(
-            "country=hk-provider=azure"
-                .parse::<Filter>()
-                .unwrap()
-                .matches(&node("HK Asia (Hong Kong - Vultr)", 2))
-        );
+                .collect();
+            assert_eq!(found, expected, "filter {source}");
+        }
+        for source in ["city=Osaka+provider=Azure", "city=Osaka&provider=Azure"] {
+            assert_eq!(source.parse::<Filter>().unwrap().to_string(), source);
+        }
+        let hong_kong = &nodes[6];
         assert!(
             !"country=hk-provider=azure"
                 .parse::<Filter>()
                 .unwrap()
-                .matches(&hong_kong)
+                .matches(hong_kong)
         );
         // A hyphen starts an exclusion, so the joined spelling is required.
         assert!(
             !"city=hong-kong"
                 .parse::<Filter>()
                 .unwrap()
-                .matches(&hong_kong)
+                .matches(hong_kong)
         );
     }
 
     #[test]
-    fn empty_conjunction_terms_are_rejected() {
-        for filter in [
+    fn invalid_filters_are_rejected() {
+        for source in [
             "",
             "+",
             "-",
@@ -415,34 +413,9 @@ mod tests {
             "&provider=azure",
             "city=osaka&&provider=azure",
             "city=osaka&+provider=azure",
+            "colo=nrt",
         ] {
-            assert!(filter.parse::<Filter>().is_err(), "accepted {filter}");
+            assert!(source.parse::<Filter>().is_err(), "accepted {source}");
         }
-    }
-
-    #[test]
-    fn filters_require_all_includes_and_subtract_excludes() {
-        let nodes = [
-            node("JP Asia (Tokyo - Vultr 2)", 1),
-            node("JP Asia (Osaka - Azure)", 2),
-            node("JP Asia (Tokyo - Azure 01)", 3),
-            node("KR Asia (Seoul - AWS)", 4),
-        ];
-        let matched = |filter: &str| -> Vec<u32> {
-            let filter: Filter = filter.parse().unwrap();
-            nodes
-                .iter()
-                .filter(|node| filter.matches(node))
-                .map(|node| node.id)
-                .collect()
-        };
-        assert_eq!(matched("Tokyo"), [1, 3]);
-        assert!(matched("tokyo+osaka-azure").is_empty());
-        assert_eq!(matched("country=jp+city=tokyo-provider=azure"), [1]);
-        assert_eq!(matched("-country=jp"), [4]);
-        assert_eq!(matched("+id=2+city=osaka"), [2]);
-        assert!(matched("+id=2+seoul").is_empty());
-        assert_eq!(matched("vultr2"), [1]);
-        assert!("colo=nrt".parse::<Filter>().is_err());
     }
 }

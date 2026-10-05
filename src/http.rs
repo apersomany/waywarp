@@ -29,12 +29,16 @@ impl<'a> Request<'a> {
     }
 
     pub fn get(&self) -> Result<Vec<u8>> {
+        self.get_with_timeout(TIMEOUT)
+    }
+
+    pub fn get_with_timeout(&self, timeout: Duration) -> Result<Vec<u8>> {
         let proxy = self
             .proxy
             .map(|proxy| ureq::Proxy::new(&format!("socks5://{proxy}")))
             .transpose()?;
         let config = Agent::config_builder()
-            .timeout_global(Some(TIMEOUT))
+            .timeout_global(Some(timeout))
             .proxy(proxy)
             .build();
         let resolver = Pinned(self.address.map(|address| (host(self.url), address)));

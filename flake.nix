@@ -7,12 +7,8 @@
     { self, nixpkgs }:
     let
       inherit (nixpkgs) lib;
-      systems = [
-        "x86_64-linux"
-        "aarch64-linux"
-      ];
-      each =
-        function:
+      forSystems =
+        systems: function:
         lib.genAttrs systems (
           system:
           function (
@@ -22,6 +18,10 @@
             }
           )
         );
+      each = forSystems [
+        "x86_64-linux"
+        "aarch64-linux"
+      ];
     in
     {
       packages = each (pkgs: {
@@ -29,25 +29,37 @@
           cloudflare-warp = pkgs.cloudflare-warp.override { headless = true; };
         };
         # A self-contained binary for release, run with the host's WARP, iproute2, and nftables.
-        static = pkgs.pkgsStatic.callPackage ./nix/package.nix { runtime = [ ]; };
+        static = pkgs.pkgsStatic.callPackage ./nix/package.nix {
+          runtime = [ ];
+          doCheck = false;
+        };
       });
 
       nixosModules.default = import ./nix/module.nix { inherit self; };
 
-      checks = each (
+      checks = forSystems [ "x86_64-linux" ] (
         pkgs:
         let
           waywarp = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+          checked = waywarp.overrideAttrs (previous: {
+            nativeBuildInputs = previous.nativeBuildInputs ++ [ pkgs.clippy ];
+            preCheck = (previous.preCheck or "") + ''
+              cargo clippy --offline --release --all-targets \
+                --target ${pkgs.stdenv.hostPlatform.rust.rustcTarget} -- -D warnings
+            '';
+          });
           source = lib.fileset.toSource {
             root = ./.;
             fileset = lib.fileset.unions [
               ./Cargo.toml
               ./src
+              ./tests
             ];
           };
         in
         {
-          package = waywarp;
+          package = checked;
+          clippy = checked;
           installer = pkgs.callPackage ./nix/installer-test.nix { };
           vm = pkgs.testers.runNixOSTest (
             import ./nix/test.nix {
@@ -55,14 +67,6 @@
               warp-stub = pkgs.callPackage ./nix/warp-stub.nix { };
             }
           );
-          clippy = waywarp.overrideAttrs (previous: {
-            pname = "${previous.pname}-clippy";
-            nativeBuildInputs = previous.nativeBuildInputs ++ [ pkgs.clippy ];
-            buildPhase = "cargo clippy --offline --all-targets -- -D warnings";
-            doCheck = false;
-            installPhase = "touch $out";
-            postFixup = "";
-          });
           format =
             pkgs.runCommand "waywarp-format"
               {

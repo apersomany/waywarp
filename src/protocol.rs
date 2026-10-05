@@ -66,53 +66,96 @@ pub struct Status {
     pub nat: Option<crate::bridge::nat::Policy>,
 }
 
-impl fmt::Display for Status {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}", self.index)?;
-        if let Some(name) = &self.name {
-            write!(formatter, " {name}")?;
-        }
-        write!(
-            formatter,
-            ": {}, {}, {}",
-            self.state, self.access, self.locations
-        )?;
-        if let Some(nat) = &self.nat {
-            let routed: Vec<_> = nat.routed.iter().map(ToString::to_string).collect();
-            let routed = if routed.is_empty() {
-                "none".into()
-            } else {
-                routed.join(" ")
-            };
-            write!(formatter, ", nat {}, routed {routed}", nat.mode)?;
-            if !nat.configuration_valid {
-                formatter.write_str(" (registration unreadable; using last verified addresses)")?;
-            }
-        }
-        if let Some(relay) = &self.relay {
-            write!(formatter, ", bootstrapped via {relay}")?;
-        }
-        match self.rebootstraps {
-            0 => {}
-            1 => formatter.write_str(", 1 rebootstrap")?,
-            count => write!(formatter, ", {count} rebootstraps")?,
-        }
-        if !self.matched {
-            formatter.write_str(", location mismatched")?;
-        }
-        Ok(())
+impl Status {
+    pub fn healthy(&self) -> bool {
+        self.state == State::Connected && self.matched
     }
+}
+
+// Preserve error boundaries across IPC instead of joining the whole chain with colons.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(from = "ReceivedFailure")]
+pub struct Failure {
+    pub message: String,
+    pub causes: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ReceivedFailure {
+    Structured {
+        message: String,
+        causes: Vec<String>,
+    },
+    Legacy(String),
+}
+
+impl From<ReceivedFailure> for Failure {
+    fn from(failure: ReceivedFailure) -> Self {
+        match failure {
+            ReceivedFailure::Structured { message, causes } => Self { message, causes },
+            ReceivedFailure::Legacy(message) => Self {
+                message,
+                causes: Vec::new(),
+            },
+        }
+    }
+}
+
+impl From<&anyhow::Error> for Failure {
+    fn from(error: &anyhow::Error) -> Self {
+        let mut chain = error.chain();
+        Self {
+            message: chain.next().expect("error has a message").to_string(),
+            causes: chain.map(ToString::to_string).collect(),
+        }
+    }
+}
+
+impl Failure {
+    pub fn into_error(self) -> anyhow::Error {
+        let mut messages = std::iter::once(self.message).chain(self.causes).rev();
+        let mut error = anyhow::Error::msg(messages.next().expect("failure has a message"));
+        for message in messages {
+            error = error.context(message);
+        }
+        error
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum Progress {
+    Registering,
+    StartingDaemon,
+    RelayProbed {
+        relay: String,
+        millis: u128,
+        colo: Option<String>,
+    },
+    RelayProbeFailed {
+        relay: String,
+        failure: Failure,
+    },
+    Migrating,
+    CheckingLocations,
+    Connecting {
+        route: String,
+    },
+    AttemptFailed {
+        route: String,
+        failure: Failure,
+    },
 }
 
 // Sent over the setup channel while `up` waits.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Event {
-    Progress(String),
+    Progress(Progress),
     Up(Box<Status>),
-    Failed(String),
+    Failed(Failure),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub enum Request {
     Status,
     // Carries stdout and stderr descriptors for warp-cli.
@@ -124,47 +167,44 @@ pub enum Request {
 pub enum Response {
     Status(Box<Status>),
     Exit(i32),
-    Failed(String),
+    Failed(Failure),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::nat::{Mode, Policy};
 
     #[test]
-    fn bridge_status_reads_as_text() {
-        let mut status = Status {
-            index: 2,
-            name: Some("hong-kong".parse().unwrap()),
-            access: Access::Bridge {
-                link: "waywarp2".into(),
-                subnets: Subnets::new(2, None, None),
-                nat: Mode::Auto,
-            },
-            state: State::Connected,
-            locations: Locations::default(),
-            relay: None,
-            matched: true,
-            rebootstraps: 0,
-            nat: Some(Policy {
-                mode: Mode::Auto,
-                routed: vec![
-                    "10.42.0.0/16".parse().unwrap(),
-                    "fd42::/64".parse().unwrap(),
-                ],
-                configuration_valid: true,
-                ..Policy::default()
-            }),
+    fn failure_round_trip_preserves_the_error_chain() {
+        let error = anyhow::anyhow!("connection refused")
+            .context("opening a relay")
+            .context("starting instance 2");
+        let wire = serde_json::to_string(&Event::Failed(Failure::from(&error))).unwrap();
+        let Event::Failed(failure) = serde_json::from_str(&wire).unwrap() else {
+            panic!("expected failure");
         };
-        let text = status.to_string();
-        assert!(text.starts_with("2 hong-kong: connected, bridge waywarp2"));
-        assert!(text.contains(", nat auto, routed 10.42.0.0/16 fd42::/64"));
-        status.nat = Some(Policy::default());
-        assert!(
-            status
-                .to_string()
-                .contains(", nat auto, routed none (registration unreadable")
+        let restored = failure.into_error();
+        assert_eq!(
+            restored
+                .chain()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            [
+                "starting instance 2",
+                "opening a relay",
+                "connection refused"
+            ]
         );
+    }
+
+    #[test]
+    fn older_supervisors_can_still_send_string_failures() {
+        let Response::Failed(failure) =
+            serde_json::from_str(r#"{"Failed":"connection refused"}"#).unwrap()
+        else {
+            panic!("expected failure");
+        };
+        assert_eq!(failure.message, "connection refused");
+        assert!(failure.causes.is_empty());
     }
 }

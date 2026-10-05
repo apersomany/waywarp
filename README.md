@@ -133,13 +133,14 @@ waywarp up proxy --accept-tos --location 'geo4=HK+geo6=HK+edge=HKG' --via mudfis
 
 Waywarp checks the locations after moving off the relay and after later reconnects. If a required location changes, it repeats connection setup. With `--no-rebootstrap`, it keeps the connection and reports the mismatch instead.
 
-`status` exits `1` if a reported instance is disconnected or fails its location checks. A healthy status does not by itself mean every destination is reachable through a bridge; routing and NAT still matter.
+`status` exits `1` unless every reported instance has a currently verified connection and meets its location requirements. A connected tunnel awaiting fresh verification is reported as degraded. A healthy status does not by itself mean every destination is reachable through a bridge; routing and NAT still matter.
 
 See [location fields](docs/locations.md) for matching rules, data sources, and limitations.
 
 ## Documentation
 
 - [Instances, logs, and troubleshooting](docs/instances.md)
+- [Terminal output and stream contracts](docs/terminal-output.md)
 - [Regions, relays, filters, and credentials](docs/regions.md)
 - [Location fields](docs/locations.md)
 - [WARP routing observations](docs/routing.md)

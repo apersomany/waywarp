@@ -3,23 +3,24 @@ use crate::bridge::{self, Subnets};
 use crate::cli::{self, Up};
 use crate::ipc::Channel;
 use crate::notify::Notifier;
+use crate::output;
 use crate::protocol::{Access, Event, Plan, Request, Response, Status};
 use crate::store::{Instance, Lock, Selector, Store};
 use crate::supervise::{self, Reporter};
 use crate::via::interface::Interface;
 use crate::via::{self, Credentials};
-use crate::warp::{self, State};
+use crate::warp;
 use anyhow::{Context, Result, bail};
+use nix::errno::Errno;
 use nix::unistd::Uid;
-use std::io::IsTerminal;
+use std::io::ErrorKind;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitCode, Stdio};
 use std::time::Duration;
-use tracing::info;
 
 const DEFAULT_EDGE: Ipv4Addr = Ipv4Addr::new(162, 159, 198, 1);
 
@@ -66,16 +67,20 @@ pub fn up(requested: cli::Access) -> Result<()> {
     let store = Store::current()?;
     let instance = store.resolve(&common.instance)?;
     let lock = instance.lock()?;
+    instance.recover_registration()?;
     if !instance.registration().join("reg.json").try_exists()?
         && let Err(error) = warp::require_consent(common.accept_tos)
     {
-        clap::Error::raw(clap::error::ErrorKind::MissingRequiredArgument, error).exit();
+        return Err(
+            clap::Error::raw(clap::error::ErrorKind::MissingRequiredArgument, error).into(),
+        );
     }
     let (access, listener) = access(&requested, instance.index)?;
+    let registration_edge = instance.registration_edge(common.edge_port)?;
+    let interface = Interface::new(common.interface.clone())?;
     if let Some(name) = &common.name {
         store.assign(&instance, name)?;
     }
-    let registration_edge = instance.registration_edge(common.edge_port)?;
     let edge = SocketAddrV4::new(
         common.edge.or(registration_edge).unwrap_or(DEFAULT_EDGE),
         common.edge_port,
@@ -84,7 +89,7 @@ pub fn up(requested: cli::Access) -> Result<()> {
         name: instance.name()?,
         instance: instance.clone(),
         access,
-        interface: Interface::new(common.interface.clone())?,
+        interface,
         edge,
         redirect_tcp: registration_edge.is_some(),
         location: common.location.clone().unwrap_or_default(),
@@ -96,19 +101,17 @@ pub fn up(requested: cli::Access) -> Result<()> {
     };
     instance.prepare()?;
     if common.foreground {
-        return supervise::run(plan, lock, listener, Reporter::Foreground(notifier)).with_context(
-            || {
-                format!(
-                    "instance {} failed; see {}",
-                    instance.index,
-                    instance.log().display()
-                )
-            },
-        );
+        return supervise::run(plan, lock, listener, Reporter::Foreground(notifier))
+            .with_context(|| format!("instance {} failed", instance.index));
     }
-    let status = detach(&plan, lock, listener)?;
-    println!("{status}");
-    Ok(())
+    let status = detach(&plan, lock, listener).with_context(|| {
+        format!(
+            "instance {} could not start\nlog: {}",
+            instance.index,
+            instance.log().display()
+        )
+    })?;
+    output::ready(&status, Some(&instance.log()))
 }
 
 // Starts a supervisor in its own session, hands it the plan, the lock, and any listener, and
@@ -137,22 +140,17 @@ fn detach(plan: &Plan, lock: Lock, listener: Option<TcpListener>) -> Result<Stat
     let mut descriptors = vec![lock.as_fd()];
     descriptors.extend(listener.as_ref().map(AsFd::as_fd));
     parent.send(plan, &descriptors)?;
-    let interactive = std::io::stderr().is_terminal();
     loop {
         let event = parent
             .receive::<Event>()?
-            .with_context(|| {
-                format!(
-                    "supervisor exited during setup; see {}",
-                    plan.instance.log().display()
-                )
-            })?
+            .context("supervisor exited during setup")?
             .0;
         match event {
-            Event::Progress(message) if interactive => eprintln!("{message}…"),
-            Event::Progress(message) => info!("{message}"),
+            Event::Progress(progress) => {
+                output::progress(plan.instance.index, plan.name.as_ref(), &progress)
+            }
             Event::Up(status) => return Ok(*status),
-            Event::Failed(reason) => bail!("{reason}"),
+            Event::Failed(failure) => return Err(failure.into_error()),
         }
     }
 }
@@ -161,11 +159,7 @@ pub fn import_registration(selector: &Selector, source: &Path, replace: bool) ->
     let instance = Store::current()?.resolve(selector)?;
     let _lock = instance.lock()?;
     instance.import_registration(source, replace)?;
-    println!(
-        "{}: imported registration from {}",
-        instance.index,
-        source.display()
-    );
+    output::imported(instance.index, source);
     Ok(())
 }
 
@@ -174,13 +168,13 @@ fn request(
     request: &Request,
     descriptors: &[std::os::fd::BorrowedFd<'_>],
 ) -> Result<Channel> {
-    let channel = Channel::connect(&instance.control()).map_err(|_| {
+    let channel = Channel::connect(&instance.control()).with_context(|| {
         let hint = if Uid::effective().is_root() {
             ""
         } else {
             " (root-owned instances are only visible with sudo)"
         };
-        anyhow::anyhow!("instance {} is not running{hint}", instance.index)
+        format!("instance {} is not running{hint}", instance.index)
     })?;
     channel.send(request, descriptors)?;
     Ok(channel)
@@ -193,11 +187,11 @@ pub fn down(selector: &Selector) -> Result<()> {
     // The supervisor closes the channel by exiting once shutdown completes.
     match channel.receive::<Response>() {
         Ok(None) => {}
-        Ok(Some((Response::Failed(reason), _))) => bail!("{reason}"),
+        Ok(Some((Response::Failed(failure), _))) => return Err(failure.into_error()),
         Ok(Some(_)) => bail!("unexpected supervisor response"),
         Err(error) => return Err(error.context("instance did not stop within 15 s")),
     }
-    println!("{} down", instance.index);
+    output::stopped(instance.index);
     Ok(())
 }
 
@@ -206,44 +200,45 @@ fn status_of(instance: &Instance) -> Result<Status> {
     channel.set_timeout(Some(Duration::from_secs(5)))?;
     match channel.expect::<Response>()?.0 {
         Response::Status(status) => Ok(*status),
-        Response::Failed(reason) => bail!("{reason}"),
+        Response::Failed(failure) => Err(failure.into_error()),
         _ => bail!("unexpected supervisor response"),
     }
 }
 
-pub fn status(selector: Option<&Selector>, json: bool) -> Result<()> {
+fn instance_stopped(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<Errno>(),
+        Some(Errno::ENOENT | Errno::ECONNREFUSED | Errno::ECONNRESET | Errno::EPIPE)
+    ) || error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == ErrorKind::UnexpectedEof)
+}
+
+pub fn status(selector: Option<&Selector>, json: bool) -> Result<ExitCode> {
     let store = Store::current()?;
     let instances = match selector {
         Some(selector) => vec![store.resolve(selector)?],
         None => store.running()?,
     };
-    let mut healthy = true;
-    let mut shown = 0;
+    let mut statuses = Vec::new();
     for instance in instances {
         let status = match status_of(&instance) {
             Ok(status) => status,
-            Err(error) if selector.is_some() => return Err(error),
             // An instance that stopped since the listing is simply no longer running.
-            Err(_) => continue,
+            Err(error) if selector.is_none() && instance_stopped(&error) => continue,
+            Err(error) => return Err(error),
         };
-        healthy &= status.state == State::Connected && status.matched;
-        shown += 1;
-        if json {
-            println!("{}", serde_json::to_string(&status)?);
-        } else {
-            println!("{status}");
-        }
+        statuses.push(status);
     }
-    if shown == 0 && !json {
-        println!("no running instances");
-    }
-    if !healthy {
-        std::process::exit(1);
-    }
-    Ok(())
+    output::statuses(&statuses, json)?;
+    Ok(if statuses.iter().all(Status::healthy) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
 }
 
-pub fn warp_cli(selector: &Selector, arguments: Vec<String>) -> Result<()> {
+pub fn warp_cli(selector: &Selector, arguments: Vec<String>) -> Result<ExitCode> {
     let instance = Store::current()?.resolve(selector)?;
     let (stdout, stderr) = (std::io::stdout(), std::io::stderr());
     let channel = request(
@@ -252,8 +247,34 @@ pub fn warp_cli(selector: &Selector, arguments: Vec<String>) -> Result<()> {
         &[stdout.as_fd(), stderr.as_fd()],
     )?;
     match channel.expect::<Response>()?.0 {
-        Response::Exit(code) => std::process::exit(code),
-        Response::Failed(reason) => bail!("{reason}"),
+        Response::Exit(code) => Ok(ExitCode::from(code as u8)),
+        Response::Failed(failure) => Err(failure.into_error()),
         _ => bail!("unexpected supervisor response"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_transport_shutdown_errors_count_as_stopped_instances() {
+        for error in [
+            anyhow::Error::from(Errno::ENOENT),
+            Errno::ECONNREFUSED.into(),
+            Errno::ECONNRESET.into(),
+            Errno::EPIPE.into(),
+            std::io::Error::new(ErrorKind::UnexpectedEof, "peer process exited").into(),
+        ] {
+            assert!(instance_stopped(&error.context("reading instance 2")));
+        }
+        for error in [
+            Errno::EAGAIN.into(),
+            Errno::EACCES.into(),
+            anyhow::anyhow!("peer process exited"),
+            anyhow::anyhow!("connection refused"),
+        ] {
+            assert!(!instance_stopped(&error));
+        }
     }
 }

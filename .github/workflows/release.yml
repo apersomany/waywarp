@@ -8,6 +8,20 @@ permissions:
   contents: read
 
 jobs:
+  check:
+    name: Check (x86_64-linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          extra_nix_config: system-features = nixos-test benchmark big-parallel kvm
+      - name: Run release checks
+        run: |
+          for check in package format installer vm; do
+            nix build --print-build-logs ".#checks.x86_64-linux.$check"
+          done
+
   build:
     name: Build (${{ matrix.system }})
     strategy:
@@ -15,22 +29,12 @@ jobs:
         include:
           - system: x86_64-linux
             runner: ubuntu-24.04
-            checks: package clippy format installer vm
           - system: aarch64-linux
             runner: ubuntu-24.04-arm
-            # GitHub's arm runners lack KVM, so the VM check runs on x86_64 only.
-            checks: package clippy format installer
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
-        with:
-          extra_nix_config: system-features = nixos-test benchmark big-parallel kvm
-      - name: Run checks
-        run: |
-          for check in ${{ matrix.checks }}; do
-            nix build --print-build-logs ".#checks.${{ matrix.system }}.$check"
-          done
       - run: nix build --print-build-logs .#static
       - run: install -m 755 result/bin/waywarp waywarp-${{ matrix.system }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -41,7 +45,7 @@ jobs:
 
   publish:
     name: Publish
-    needs: build
+    needs: [check, build]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

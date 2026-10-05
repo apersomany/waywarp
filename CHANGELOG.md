@@ -4,6 +4,26 @@ Changes are listed here using [Keep a Changelog](https://keepachangelog.com/en/1
 
 ## Unreleased
 
+## 0.1.2
+
+### Changed
+
+- Human status uses compact, aligned rows, including a colored `Instance` row and `ADDRESS (proxy)` or `LINK (bridge)` access values.
+- Lifecycle messages, including `down` and `import` confirmations, use tracing on stderr with structured instance context retained in detached logs.
+- Diagnostics use a shared renderer and preserve structured error causes. JSON status and native `warp-cli` output remain unchanged.
+- Relay providers are expanded only when reached, so an unavailable later provider cannot prevent an earlier route from succeeding.
+- CI combines package tests and Clippy; tagged releases also run the installer and VM integration checks before publishing.
+
+### Fixed
+
+- Missing-consent diagnostics end with a newline without changing Clap's styling, stream, or exit code.
+- QUIC reconnects and kernel link changes trigger fresh tunnel verification. Stale location probes cannot mark a changed connection healthy.
+- Bridge routes, MTU, and NAT are reconciled after link recreation and address changes, including changes without a CLI reconnect.
+- Startup cancellation interrupts helper processes, paced relay authentication, and relay socket operations, then cleans up instance resources.
+- Malformed or truncated IPC messages close received descriptors, and status errors are no longer silently treated as stopped instances.
+- Registration imports recover interrupted replacements, and location cache updates are validated before replacing existing data.
+- TCP forwarding handles nonblocking connection establishment, transient accept failures, and cancellation without stalling the packet loop.
+
 ## 0.1.1
 
 ### Changed

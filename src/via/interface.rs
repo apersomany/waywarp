@@ -3,11 +3,10 @@
 use anyhow::{Context, Result, bail};
 use nix::{ifaddrs::getifaddrs, libc};
 use serde::{Deserialize, Serialize};
-use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket};
 use std::path::Path;
-use std::time::Duration;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Interface {
@@ -15,6 +14,28 @@ pub enum Interface {
     Named(String),
     // Follows the host's routes, so moving between networks moves new sockets with it.
     Routed,
+}
+
+fn connect_socket(socket: Socket, destination: SocketAddr) -> Result<TcpStream> {
+    socket.set_nonblocking(true)?;
+    match socket.connect(&destination.into()) {
+        Ok(()) => {}
+        Err(error) if error.raw_os_error() == Some(libc::EINPROGRESS) => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(socket.into())
+}
+
+// Uses the calling namespace's routes, without stalling the packet loop during establishment.
+pub fn connect_tcp(destination: SocketAddr) -> Result<TcpStream> {
+    connect_socket(
+        Socket::new(
+            Domain::for_address(destination),
+            Type::STREAM.cloexec(),
+            Some(Protocol::TCP),
+        )?,
+        destination,
+    )
 }
 
 fn physical(name: &str) -> bool {
@@ -102,20 +123,6 @@ impl Interface {
 
     // A nonblocking TCP connection to `destination` that is still being established.
     pub fn tcp(&self, destination: SocketAddrV4) -> Result<TcpStream> {
-        let socket = self.socket(destination, Type::STREAM)?;
-        socket.set_nonblocking(true)?;
-        match socket.connect(&SocketAddr::V4(destination).into()) {
-            Ok(()) => {}
-            Err(error) if error.raw_os_error() == Some(libc::EINPROGRESS) => {}
-            Err(error) => return Err(error.into()),
-        }
-        Ok(socket.into())
-    }
-
-    // A blocking TCP connection to `destination`.
-    pub fn connect(&self, destination: SocketAddrV4, timeout: Duration) -> Result<TcpStream> {
-        let socket = self.socket(destination, Type::STREAM)?;
-        socket.connect_timeout(&SockAddr::from(destination), timeout)?;
-        Ok(socket.into())
+        connect_socket(self.socket(destination, Type::STREAM)?, destination.into())
     }
 }

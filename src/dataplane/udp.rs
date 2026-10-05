@@ -1,7 +1,9 @@
 // Carries the private namespace's UDP out of the physical interface, one host socket per flow so
 // each reply maps back to exactly one private source. While bootstrapping, tunnel flows use a
 // SOCKS5 relay and other underlay UDP stays direct; `migrate` moves the tunnel flows to direct sockets.
+use super::Observer;
 use super::packet::{self, HEADERS};
+use super::quic;
 use crate::via::interface::Interface;
 use crate::via::{Relay, Route, socks5};
 use mio::net::UdpSocket;
@@ -41,8 +43,9 @@ pub(super) struct Association {
 pub(super) fn prepare(
     interface: &Interface,
     relay: &crate::via::Relay,
+    observer: &Observer,
 ) -> anyhow::Result<Association> {
-    let (control, address) = socks5::associate(interface, relay)?;
+    let (control, address) = socks5::associate(interface, relay, observer)?;
     Ok(Association {
         socket: UdpSocket::from_std(interface.udp(address)?),
         relay: address,
@@ -52,7 +55,9 @@ pub(super) fn prepare(
 
 pub(super) enum Routing {
     Blocked,
-    Direct,
+    Direct {
+        edge: SocketAddrV4,
+    },
     Relayed {
         relay: Relay,
         edge: SocketAddrV4,
@@ -61,15 +66,23 @@ pub(super) enum Routing {
 }
 
 impl Routing {
+    fn edge(&self) -> Option<SocketAddrV4> {
+        match self {
+            Self::Blocked => None,
+            Self::Direct { edge } | Self::Relayed { edge, .. } => Some(*edge),
+        }
+    }
+
     pub fn prepare(
         interface: &Interface,
         route: Route,
         edge: SocketAddrV4,
+        observer: &Observer,
     ) -> anyhow::Result<Self> {
         Ok(match route {
-            Route::Direct => Self::Direct,
+            Route::Direct => Self::Direct { edge },
             Route::Relay(relay) => {
-                let association = prepare(interface, &relay)?;
+                let association = prepare(interface, &relay, observer)?;
                 Self::Relayed {
                     relay,
                     edge,
@@ -110,6 +123,7 @@ struct Flow {
     direct: UdpSocket,
     path: Path,
     last_used: Instant,
+    connection: quic::Connection,
 }
 
 type Associated = (usize, u64, anyhow::Result<Association>);
@@ -127,12 +141,17 @@ pub struct Flows {
     results: (mpsc::Sender<Associated>, mpsc::Receiver<Associated>),
     waker: Arc<Waker>,
     last_sweep: Instant,
-    // Answered once an edge replies on a direct socket after `migrate`.
-    migrated: Option<(SocketAddrV4, mpsc::Sender<()>)>,
+    observer: Observer,
 }
 
 impl Flows {
-    pub fn new(tun: File, interface: Interface, waker: Arc<Waker>, base: usize) -> Self {
+    pub fn new(
+        tun: File,
+        interface: Interface,
+        waker: Arc<Waker>,
+        base: usize,
+        observer: Observer,
+    ) -> Self {
         Self {
             tun,
             interface,
@@ -146,7 +165,7 @@ impl Flows {
             results: mpsc::channel(),
             waker,
             last_sweep: Instant::now(),
-            migrated: None,
+            observer,
         }
     }
 
@@ -209,20 +228,20 @@ impl Flows {
                 Path::Direct
             },
             last_used: Instant::now(),
+            connection: quic::Connection::default(),
         });
         self.keys.insert(key, index);
         Some((index, self.generation))
     }
 
-    pub fn tun_ready(&mut self, registry: &Registry) {
-        loop {
+    pub fn tun_ready(&mut self, registry: &Registry) -> std::io::Result<()> {
+        while !self.observer.stopped() {
             let length = match self.tun.read(&mut self.buffer) {
+                Ok(0) => return Err(ErrorKind::UnexpectedEof.into()),
                 Ok(length) => length,
                 Err(error) if error.kind() == ErrorKind::WouldBlock => break,
-                Err(error) => {
-                    warn!(%error, "TUN read failed");
-                    break;
-                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
             };
             let Some(datagram) = packet::outbound(&self.buffer[..length]) else {
                 continue;
@@ -242,12 +261,9 @@ impl Flows {
             let flow = &mut self.slab[index];
             flow.last_used = Instant::now();
             let payload = &self.buffer[datagram.payload];
-            match &mut flow.path {
-                Path::Direct => send(&flow.direct, payload, key.destination),
-                Path::Pending(queued) => queued.push(payload),
-                Path::Relayed(association) => relay_send(association, key.destination, payload),
-            }
+            forward(flow, payload, self.routing.edge(), &self.observer);
         }
+        Ok(())
     }
 
     fn open(&mut self, registry: &Registry, key: Key) -> Option<usize> {
@@ -294,8 +310,9 @@ impl Flows {
             let interface = self.interface.clone();
             let results = self.results.0.clone();
             let waker = Arc::clone(&self.waker);
+            let observer = self.observer.clone();
             std::thread::spawn(move || {
-                let result = prepare(&interface, &relay);
+                let result = prepare(&interface, &relay, &observer);
                 let _ = results.send((index, generation, result));
                 let _ = waker.wake();
             });
@@ -348,16 +365,15 @@ impl Flows {
             self.close(registry, index);
         }
         self.routing = routing;
-        self.migrated = None;
+        self.observer.path_changed();
     }
 
-    // Abandons the relay: every flow continues on its direct socket, whose new source address
-    // QUIC connection migration accepts, so the edge session and its colo carry over.
-    pub fn migrate(&mut self, registry: &Registry, answered: mpsc::Sender<()>) {
-        self.migrated = match std::mem::replace(&mut self.routing, Routing::Direct) {
-            Routing::Relayed { edge, .. } => Some((edge, answered)),
-            _ => None,
+    pub fn migrate(&mut self, registry: &Registry) {
+        let Some(edge) = self.routing.edge() else {
+            return;
         };
+        self.routing = Routing::Direct { edge };
+        self.observer.path_changed();
         for (_, flow) in self.slab.iter_mut() {
             if let Path::Relayed(association) = &mut flow.path {
                 let _ = registry.deregister(&mut association.socket);
@@ -366,14 +382,14 @@ impl Flows {
         }
     }
 
-    pub fn socket_ready(&mut self, token: Token) {
+    pub fn socket_ready(&mut self, token: Token) -> std::io::Result<()> {
         let offset = token.0 - self.base;
         let (index, relayed) = (offset / 2, offset % 2 == 1);
         let Some(flow) = self.slab.get_mut(index) else {
-            return;
+            return Ok(());
         };
         let key = flow.key;
-        loop {
+        while !self.observer.stopped() {
             let (socket, start, expected) = match (&flow.path, relayed) {
                 (Path::Direct, false) => (&flow.direct, PAYLOAD, SocketAddr::V4(key.destination)),
                 (Path::Relayed(association), true) => (
@@ -382,15 +398,22 @@ impl Flows {
                     SocketAddr::V4(association.relay),
                 ),
                 // Late replies on an abandoned path are dropped by leaving them unread.
-                _ => return,
+                _ => return Ok(()),
             };
             let (length, sender) = match socket.recv_from(&mut self.buffer[start..]) {
                 Ok(received) => received,
-                Err(error) if error.kind() == ErrorKind::WouldBlock => return,
-                Err(error) if error.kind() == ErrorKind::ConnectionRefused => continue,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(()),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::ConnectionRefused | ErrorKind::Interrupted
+                    ) =>
+                {
+                    continue;
+                }
                 Err(error) => {
                     debug!(destination = %key.destination, %error, "UDP flow failed");
-                    return;
+                    return Ok(());
                 }
             };
             if sender != expected {
@@ -402,24 +425,27 @@ impl Flows {
                 }
                 length - socks5::HEADER
             } else {
-                if let Some((_, answered)) =
-                    self.migrated.take_if(|(edge, _)| *edge == key.destination)
-                {
-                    let _ = answered.send(());
-                }
                 length
             };
             if payload > packet::MAX_PAYLOAD {
                 continue;
             }
+            if self.routing.edge() == Some(key.destination) {
+                let change = flow
+                    .connection
+                    .downlink(&self.buffer[PAYLOAD..PAYLOAD + payload]);
+                self.observer.observe(change);
+            }
             flow.last_used = Instant::now();
             let frame = packet::inbound(&mut self.buffer, payload, key.destination, key.source);
-            if let Err(error) = (&self.tun).write(frame)
-                && error.kind() != ErrorKind::WouldBlock
-            {
-                warn!(%error, "TUN write failed");
+            match (&self.tun).write(frame) {
+                Ok(length) if length == frame.len() => {}
+                Ok(_) => return Err(ErrorKind::WriteZero.into()),
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
             }
         }
+        Ok(())
     }
 
     pub fn sweep(&mut self, registry: &Registry) {
@@ -440,6 +466,17 @@ impl Flows {
     }
 }
 
+fn forward(flow: &mut Flow, payload: &[u8], edge: Option<SocketAddrV4>, observer: &Observer) {
+    if edge == Some(flow.key.destination) {
+        observer.observe(flow.connection.uplink(payload));
+    }
+    match &mut flow.path {
+        Path::Direct => send(&flow.direct, payload, flow.key.destination),
+        Path::Pending(queued) => queued.push(payload),
+        Path::Relayed(association) => relay_send(association, flow.key.destination, payload),
+    }
+}
+
 fn send(socket: &UdpSocket, payload: &[u8], destination: SocketAddrV4) {
     if let Err(error) = socket.send_to(payload, destination.into())
         && !matches!(
@@ -455,15 +492,15 @@ fn relay_send(association: &Association, destination: SocketAddrV4, payload: &[u
     let mut frame = Vec::with_capacity(socks5::HEADER + payload.len());
     frame.extend_from_slice(&socks5::header(destination));
     frame.extend_from_slice(payload);
-    send(&association.socket, &frame, association.relay);
+    send(&association.socket, &frame, association.relay)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::quic::fixtures::{long, short};
     use super::*;
 
-    #[test]
-    fn dns_stays_direct_and_cannot_confirm_tunnel_migration() {
+    fn direct_flow() -> (mio::Poll, Flows, std::net::UdpSocket, usize) {
         let poll = mio::Poll::new().unwrap();
         let waker = Arc::new(Waker::new(poll.registry(), Token(0)).unwrap());
         let tun = std::fs::OpenOptions::new()
@@ -471,7 +508,71 @@ mod tests {
             .write(true)
             .open("/dev/null")
             .unwrap();
-        let mut flows = Flows::new(tun, Interface::Named("lo".into()), waker, 16);
+        let mut flows = Flows::new(
+            tun,
+            Interface::Named("lo".into()),
+            waker,
+            16,
+            Observer::default(),
+        );
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let SocketAddr::V4(edge) = peer.local_addr().unwrap() else {
+            unreachable!()
+        };
+        flows.reset(poll.registry(), Routing::Direct { edge });
+        let index = flows
+            .open(
+                poll.registry(),
+                Key {
+                    source: "10.79.0.2:5000".parse().unwrap(),
+                    destination: edge,
+                },
+            )
+            .unwrap();
+        (poll, flows, peer, index)
+    }
+
+    fn reply(flows: &mut Flows, peer: &std::net::UdpSocket, index: usize, payload: &[u8]) {
+        peer.send_to(
+            payload,
+            (
+                "127.0.0.1",
+                flows.slab[index].direct.local_addr().unwrap().port(),
+            ),
+        )
+        .unwrap();
+        flows.socket_ready(flows.token(index, false)).unwrap();
+    }
+
+    fn outbound(flows: &mut Flows, peer: &std::net::UdpSocket, index: usize, payload: &[u8]) {
+        forward(
+            &mut flows.slab[index],
+            payload,
+            flows.routing.edge(),
+            &flows.observer,
+        );
+        let mut received = [0; 2048];
+        let length = peer.recv(&mut received).unwrap();
+        assert_eq!(&received[..length], payload);
+    }
+
+    #[test]
+    fn dns_stays_direct_when_tunnel_associations_are_exhausted() {
+        let poll = mio::Poll::new().unwrap();
+        let waker = Arc::new(Waker::new(poll.registry(), Token(0)).unwrap());
+        let tun = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        let mut flows = Flows::new(
+            tun,
+            Interface::Named("lo".into()),
+            waker,
+            16,
+            Observer::default(),
+        );
         let tunnel = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let resolver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let address = |socket: &std::net::UdpSocket| {
@@ -487,15 +588,18 @@ mod tests {
             destination: address(&resolver),
         };
         assert!(flows.open(poll.registry(), dns).is_none());
-        flows.routing = Routing::Relayed {
-            relay: Relay {
-                label: "test".into(),
-                server: edge,
-                login: None,
+        flows.reset(
+            poll.registry(),
+            Routing::Relayed {
+                relay: Relay {
+                    label: "test".into(),
+                    server: edge,
+                    login: None,
+                },
+                edge,
+                prepared: None,
             },
-            edge,
-            prepared: None,
-        };
+        );
         flows.pending = MAX_PENDING;
         let dns_index = flows.open(poll.registry(), dns).unwrap();
         assert!(matches!(flows.slab[dns_index].path, Path::Direct));
@@ -505,8 +609,7 @@ mod tests {
             destination: edge,
         };
         assert!(flows.open(poll.registry(), tunnel_key).is_none());
-        let (answered, answer) = mpsc::channel();
-        flows.migrate(poll.registry(), answered);
+        flows.migrate(poll.registry());
         let reply = |socket: &std::net::UdpSocket, flow: &Flow| {
             socket
                 .send_to(
@@ -516,12 +619,103 @@ mod tests {
                 .unwrap();
         };
         reply(&resolver, &flows.slab[dns_index]);
-        flows.socket_ready(flows.token(dns_index, false));
-        assert!(matches!(answer.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        flows.socket_ready(flows.token(dns_index, false)).unwrap();
         let tunnel_index = flows.open(poll.registry(), tunnel_key).unwrap();
         reply(&tunnel, &flows.slab[tunnel_index]);
-        flows.socket_ready(flows.token(tunnel_index, false));
-        assert_eq!(answer.try_recv(), Ok(()));
+        flows
+            .socket_ready(flows.token(tunnel_index, false))
+            .unwrap();
+    }
+
+    #[test]
+    fn closed_tun_is_an_error_instead_of_a_busy_loop() {
+        let (poll, mut flows, _, _) = direct_flow();
+        assert_eq!(
+            flows.tun_ready(poll.registry()).unwrap_err().kind(),
+            ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn unexpected_senders_are_dropped_and_opaque_traffic_still_forwards() {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixDatagram;
+        let (_, mut flows, peer, index) = direct_flow();
+        outbound(
+            &mut flows,
+            &peer,
+            index,
+            &long(1, 0, b"original", b"client"),
+        );
+        reply(&mut flows, &peer, index, &long(1, 0, b"client", b"server"));
+        outbound(&mut flows, &peer, index, &short(b"server"));
+        let generation = flows.observer.generation();
+        let (tun, received) = UnixDatagram::pair().unwrap();
+        flows.tun = File::from(OwnedFd::from(tun));
+        received
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        let stranger = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        reply(&mut flows, &stranger, index, &short(b"client"));
+        assert_eq!(flows.observer.generation(), generation);
+        let mut frame = [0; 2048];
+        let error = received.recv(&mut frame).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            ErrorKind::WouldBlock | ErrorKind::TimedOut
+        ));
+        outbound(&mut flows, &peer, index, b"opaque request");
+        reply(&mut flows, &peer, index, b"opaque response");
+        let length = received.recv(&mut frame).unwrap();
+        let datagram = packet::outbound(&frame[..length]).unwrap();
+        assert_eq!(&frame[datagram.payload], b"opaque response");
+        assert_eq!(flows.observer.generation(), generation);
+    }
+
+    #[test]
+    fn pending_relay_packets_detect_attempts_without_transmission() {
+        let (_, mut flows, _, index) = direct_flow();
+        flows.slab[index].path = Path::Pending(Pending::default());
+        forward(
+            &mut flows.slab[index],
+            &long(1, 0, b"server", b"client"),
+            flows.routing.edge(),
+            &flows.observer,
+        );
+        assert_eq!(flows.observer.generation().attempts, 1);
+        let Path::Pending(queued) = &flows.slab[index].path else {
+            unreachable!()
+        };
+        assert_eq!(queued.packets.len(), 1);
+    }
+
+    #[test]
+    fn cid_changes_forward_without_invalidating_verified_generations() {
+        let (_, mut flows, peer, index) = direct_flow();
+        outbound(
+            &mut flows,
+            &peer,
+            index,
+            &long(1, 0, b"original", b"client"),
+        );
+        reply(&mut flows, &peer, index, &long(1, 0, b"client", b"server"));
+        outbound(&mut flows, &peer, index, &long(1, 2, b"server", b"client"));
+        outbound(&mut flows, &peer, index, &short(b"server"));
+        reply(&mut flows, &peer, index, &short(b"client"));
+        let verified = flows.observer.generation();
+        assert_eq!(verified.attempts, 1);
+        assert_eq!(verified.exchanges, 1);
+        assert!(flows.observer.confirm(verified));
+        outbound(&mut flows, &peer, index, &short(b"rotated"));
+        reply(&mut flows, &peer, index, &short(b"rotated"));
+        assert!(flows.observer.pending(Duration::ZERO).is_none());
+        outbound(
+            &mut flows,
+            &peer,
+            index,
+            &long(1, 0, b"server", b"reconnected"),
+        );
+        assert!(flows.observer.pending(Duration::ZERO).is_some());
     }
 
     #[test]

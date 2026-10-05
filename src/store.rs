@@ -5,11 +5,13 @@ use nix::unistd::Uid;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError};
+use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::fd::OwnedFd;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // Root and each unprivileged account have separate stores, and so separate index spaces.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -92,6 +94,27 @@ fn private_directory(path: &Path) -> Result<()> {
     fs::create_dir_all(path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     Ok(())
+}
+
+pub fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let temporary = path.with_extension(format!("{}.{nonce}.new", std::process::id()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    let result = (|| {
+        file.write_all(data)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        File::open(path.parent().context("file has no parent directory")?)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
 }
 
 impl Store {
@@ -184,8 +207,7 @@ impl Store {
             bail!("the name {name} belongs to instance {}", owner.index);
         }
         private_directory(&instance.state())?;
-        fs::write(instance.state().join("name"), name.to_string())?;
-        Ok(())
+        atomic_write(&instance.state().join("name"), name.to_string().as_bytes())
     }
 
     pub fn running(&self) -> Result<Vec<Instance>> {
@@ -280,7 +302,30 @@ impl Instance {
         }
     }
 
+    // Callers hold the instance lock, including callers checking whether consent is needed.
+    pub fn recover_registration(&self) -> Result<()> {
+        let target = self.registration();
+        let temporary = self.state().join(".registration-import");
+        let backup = self.state().join(".registration-backup");
+        if !target.join("reg.json").is_file() && backup.join("reg.json").is_file() {
+            if target.exists() {
+                fs::remove_dir_all(&target)?;
+            }
+            fs::rename(&backup, &target)?;
+            File::open(self.state())?.sync_all()?;
+        } else if target.join("reg.json").is_file() && backup.exists() {
+            File::open(self.state())?.sync_all()?;
+            fs::remove_dir_all(&backup)?;
+            File::open(self.state())?.sync_all()?;
+        }
+        if temporary.exists() {
+            fs::remove_dir_all(temporary)?;
+        }
+        Ok(())
+    }
+
     pub fn registration_edge(&self, port: u16) -> Result<Option<Ipv4Addr>> {
+        self.recover_registration()?;
         #[derive(Deserialize)]
         struct Configuration {
             account: Account,
@@ -331,8 +376,9 @@ impl Instance {
             "warp.db",
         ];
 
+        self.recover_registration()?;
         let target = self.registration();
-        if target.join("reg.json").exists() && !replace {
+        if target.join("reg.json").is_file() && !replace {
             bail!(
                 "instance {} already has a registration; pass --replace to overwrite it",
                 self.index
@@ -345,11 +391,6 @@ impl Instance {
         private_directory(&self.state())?;
         let temporary = self.state().join(".registration-import");
         let backup = self.state().join(".registration-backup");
-        for leftover in [&temporary, &backup] {
-            if leftover.exists() {
-                fs::remove_dir_all(leftover)?;
-            }
-        }
         private_directory(&temporary)?;
         for name in FILES {
             let from = source.join(name);
@@ -362,9 +403,12 @@ impl Instance {
             let to = temporary.join(name);
             fs::copy(&from, &to).with_context(|| format!("copying {}", from.display()))?;
             fs::set_permissions(&to, fs::Permissions::from_mode(0o600))?;
+            File::open(&to)?.sync_all()?;
         }
+        File::open(&temporary)?.sync_all()?;
         if target.exists() {
             fs::rename(&target, &backup)?;
+            File::open(self.state())?.sync_all()?;
         }
         if let Err(error) = fs::rename(&temporary, &target) {
             if backup.exists() {
@@ -372,14 +416,17 @@ impl Instance {
             }
             return Err(error.into());
         }
+        File::open(self.state())?.sync_all()?;
         if backup.exists() {
             fs::remove_dir_all(backup)?;
+            File::open(self.state())?.sync_all()?;
         }
         Ok(())
     }
 
     // Callers hold the instance lock, so nothing else is using these paths.
     pub fn prepare(&self) -> Result<()> {
+        self.recover_registration()?;
         for path in [
             &self.store.state,
             &self.state(),
@@ -405,18 +452,14 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use crate::test_support::TempDirectory;
+    use std::time::{Duration, Instant};
 
-    fn temporary_store(label: &str) -> (PathBuf, Store) {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("waywarp-{label}-{}-{nonce}", std::process::id()));
+    fn temporary_store(label: &str) -> (TempDirectory, Store) {
+        let root = TempDirectory::new(label);
         let store = Store {
-            state: root.join("state"),
-            runtime: root.join("runtime"),
+            state: root.path.join("state"),
+            runtime: root.path.join("runtime"),
         };
         (root, store)
     }
@@ -433,7 +476,7 @@ mod tests {
 
     #[test]
     fn names_are_unique_and_follow_renames() {
-        let (root, store) = temporary_store("names");
+        let (_root, store) = temporary_store("names");
         let tokyo: Name = "tokyo".parse().unwrap();
         let osaka: Name = "osaka".parse().unwrap();
         store.assign(&store.instance(2), &tokyo).unwrap();
@@ -444,12 +487,11 @@ mod tests {
         assert!(store.resolve(&selector).is_err());
         store.assign(&store.instance(3), &tokyo).unwrap();
         assert_eq!(store.resolve(&selector).unwrap().index, 3);
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn locks_exclude_each_other_until_released() {
-        let (root, store) = temporary_store("lock");
+        let (_root, store) = temporary_store("lock");
         let instance = store.instance(1);
         let lock = instance.lock().unwrap();
         assert!(instance.lock().is_err());
@@ -465,15 +507,52 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(1));
         }
-        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovers_backup_before_discarding_staging() {
+        let (_root, store) = temporary_store("recovery");
+        for (index, target, expected) in [
+            (1, None, "old"),
+            (2, Some(false), "old"),
+            (3, Some(true), "new"),
+        ] {
+            let instance = store.instance(index);
+            fs::create_dir_all(instance.state().join(".registration-backup")).unwrap();
+            fs::write(
+                instance.state().join(".registration-backup/reg.json"),
+                "old",
+            )
+            .unwrap();
+            fs::create_dir_all(instance.state().join(".registration-import")).unwrap();
+            fs::write(
+                instance.state().join(".registration-import/reg.json"),
+                "partial",
+            )
+            .unwrap();
+            if let Some(valid) = target {
+                fs::create_dir_all(instance.registration()).unwrap();
+                if valid {
+                    fs::write(instance.registration().join("reg.json"), "new").unwrap();
+                }
+            }
+            instance.prepare().unwrap();
+            assert_eq!(
+                fs::read_to_string(instance.registration().join("reg.json")).unwrap(),
+                expected
+            );
+            assert!(!instance.state().join(".registration-backup").exists());
+            assert!(!instance.state().join(".registration-import").exists());
+        }
     }
 
     #[test]
     fn imports_registration_and_finds_team_edge() {
         let (root, store) = temporary_store("import");
-        let source = root.join("source");
+        let source = root.path.join("source");
         fs::create_dir_all(&source).unwrap();
         fs::write(source.join("reg.json"), "first").unwrap();
+        fs::write(source.join("unrelated"), "not imported").unwrap();
         fs::write(
             source.join("conf.json"),
             r#"{"account":{"account_type":"team"},"endpoints":[{"v4":"192.0.2.4:443"}]}"#,
@@ -482,6 +561,11 @@ mod tests {
         let instance = store.instance(7);
 
         instance.import_registration(&source, false).unwrap();
+        assert!(!instance.registration().join("unrelated").exists());
+        assert_eq!(
+            fs::read_to_string(source.join("reg.json")).unwrap(),
+            "first"
+        );
         assert_eq!(
             instance.registration_edge(443).unwrap(),
             Some(Ipv4Addr::new(192, 0, 2, 4))
@@ -501,6 +585,11 @@ mod tests {
             fs::read_to_string(instance.registration().join("reg.json")).unwrap(),
             "second"
         );
-        fs::remove_dir_all(root).unwrap();
+        fs::write(source.join("reg.json"), "third").unwrap();
+        instance.import_registration(&source, true).unwrap();
+        assert_eq!(
+            fs::read_to_string(instance.registration().join("reg.json")).unwrap(),
+            "third"
+        );
     }
 }

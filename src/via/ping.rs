@@ -1,10 +1,14 @@
 // Screens relays before WARP uses one: a QUIC round trip through the relay proves UDP reaches the
 // edge, and a trace through it hints at the colo that would serve it.
 use super::interface::Interface;
+use super::transport::{check_cancelled, socket_io};
 use super::{Relay, socks5};
-use anyhow::{Context, Result, bail};
+use crate::dataplane::Observer;
+use anyhow::{Context, Result};
+use nix::poll::PollFlags;
 use std::io::{Read, Write};
 use std::net::SocketAddrV4;
+use std::os::fd::AsFd;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -37,10 +41,14 @@ fn is_version_negotiation(packet: &[u8], connection: &[u8; 8]) -> bool {
         && packet[6..14] == connection[..]
 }
 
-fn udp_rtt(interface: &Interface, relay: &Relay, edge: SocketAddrV4) -> Result<Duration> {
-    let (_control, association) = socks5::associate(interface, relay)?;
+fn udp_rtt(
+    interface: &Interface,
+    relay: &Relay,
+    edge: SocketAddrV4,
+    observer: &Observer,
+) -> Result<Duration> {
+    let (_control, association) = socks5::associate(interface, relay, observer)?;
     let socket = interface.udp(association)?;
-    socket.set_nonblocking(false)?;
     socket.connect(association)?;
     let connection = super::seed().to_be_bytes();
     let mut frame = socks5::header(edge).to_vec();
@@ -48,16 +56,22 @@ fn udp_rtt(interface: &Interface, relay: &Relay, edge: SocketAddrV4) -> Result<D
     let deadline = Instant::now() + TIMEOUT;
     let mut buffer = [0; 2048];
     let started = Instant::now();
-    socket.send(&frame)?;
+    socket_io(
+        socket.as_fd(),
+        PollFlags::POLLOUT,
+        deadline,
+        observer,
+        || socket.send(&frame),
+    )?;
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            bail!("the edge did not answer over UDP");
-        }
-        socket.set_read_timeout(Some(remaining))?;
-        let length = socket
-            .recv(&mut buffer)
-            .context("the edge did not answer over UDP")?;
+        let length = socket_io(
+            socket.as_fd(),
+            PollFlags::POLLIN,
+            deadline,
+            observer,
+            || socket.recv(&mut buffer),
+        )
+        .context("the edge did not answer over UDP")?;
         if let Some(payload) = socks5::payload(edge, &buffer[..length])
             && is_version_negotiation(payload, &connection)
         {
@@ -66,9 +80,9 @@ fn udp_rtt(interface: &Interface, relay: &Relay, edge: SocketAddrV4) -> Result<D
     }
 }
 
-fn trace_colo(interface: &Interface, relay: &Relay) -> Result<String> {
-    let mut stream = socks5::connect(interface, relay, TRACE_HOST, 80)?;
-    stream.set_read_timeout(Some(TIMEOUT))?;
+fn trace_colo(interface: &Interface, relay: &Relay, observer: &Observer) -> Result<String> {
+    let mut stream = socks5::connect(interface, relay, TRACE_HOST, 80, observer)?;
+    stream.set_timeout(TIMEOUT);
     write!(
         stream,
         "GET /cdn-cgi/trace HTTP/1.1\r\nHost: {TRACE_HOST}\r\nConnection: close\r\n\r\n"
@@ -82,10 +96,16 @@ fn trace_colo(interface: &Interface, relay: &Relay) -> Result<String> {
         .context("the trace response had no colo")
 }
 
-pub fn ping(interface: &Interface, relay: &Relay, edge: SocketAddrV4) -> Result<Ping> {
-    let rtt = udp_rtt(interface, relay, edge)?;
+pub fn ping(
+    interface: &Interface,
+    relay: &Relay,
+    edge: SocketAddrV4,
+    observer: &Observer,
+) -> Result<Ping> {
+    let rtt = udp_rtt(interface, relay, edge, observer)?;
     // The colo is only a hint: WARP reaches a different anycast address over UDP.
-    let colo = trace_colo(interface, relay).ok();
+    let colo = trace_colo(interface, relay, observer).ok();
+    check_cancelled(observer)?;
     Ok(Ping { rtt, colo })
 }
 
@@ -95,17 +115,19 @@ pub fn stream(
     interface: &Interface,
     relays: Vec<Relay>,
     edge: SocketAddrV4,
+    observer: &Observer,
 ) -> mpsc::Receiver<(Relay, Result<Ping>)> {
     let queue = Arc::new(Mutex::new(relays.into_iter()));
     let (sender, receiver) = mpsc::channel();
     for _ in 0..CONCURRENCY {
         let (queue, sender, interface) = (Arc::clone(&queue), sender.clone(), interface.clone());
+        let observer = observer.clone();
         thread::spawn(move || {
-            loop {
+            while !observer.stopped() {
                 let Some(relay) = queue.lock().unwrap().next() else {
                     return;
                 };
-                let ping = ping(&interface, &relay, edge);
+                let ping = ping(&interface, &relay, edge, &observer);
                 if sender.send((relay, ping)).is_err() {
                     return;
                 }
@@ -118,6 +140,48 @@ pub fn stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelling_probe_workers_closes_the_stream_while_authentication_is_locked() {
+        let directory = crate::test_support::TempDirectory::new("probe-cancel");
+        let path = directory.path.join("limiter");
+        let limiter = std::fs::File::create(&path).unwrap();
+        limiter.lock().unwrap();
+        let relay = Relay {
+            label: "test".into(),
+            server: "127.0.0.1:1".parse().unwrap(),
+            login: Some(crate::via::Login {
+                username: "user".into(),
+                password: "password".into(),
+                auth_limit: Some(path),
+            }),
+        };
+        let observer = Observer::default();
+        let receiver = stream(
+            &Interface::Named("lo".into()),
+            vec![relay; CONCURRENCY * 2],
+            "192.0.2.1:443".parse().unwrap(),
+            &observer,
+        );
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        observer.stop();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let closed = loop {
+            match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok((_, result)) => assert_eq!(
+                    result.err().unwrap().root_cause().to_string(),
+                    "relay operation was cancelled"
+                ),
+                Err(mpsc::RecvTimeoutError::Disconnected) => break true,
+                Err(mpsc::RecvTimeoutError::Timeout) => break false,
+            }
+        };
+        drop(limiter);
+        assert!(closed, "probe workers stayed blocked after cancellation");
+    }
 
     #[test]
     fn version_negotiation_probe_is_recognized_only_for_its_connection() {

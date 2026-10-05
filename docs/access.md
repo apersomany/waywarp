@@ -29,7 +29,7 @@ Network managers can remove rules and routes they did not create. systemd-networ
 
 Each index gets different default subnets. If they conflict with your network, choose others with `--subnet4` and `--subnet6`. IPv4 subnets must be canonical `/30` networks and IPv6 subnets canonical `/126` networks. `up` rejects subnets that overlap an existing host route.
 
-The bridge uses WARP's MTU, so the host can reject oversized packets and tell their senders. Waywarp also clamps TCP MSS in both directions. Routes, MTU, and NAT are updated after reconnects so they follow WARP's recreated link.
+The bridge uses WARP's MTU, so the host can reject oversized packets and tell their senders. Waywarp also clamps TCP MSS in both directions. Routes, MTU, and NAT are updated after reconnects and kernel link/address changes so they follow WARP's current link even without a CLI reconnect.
 
 ## Firewall and NAT
 
@@ -49,7 +49,7 @@ Incoming traffic for those assigned WARP addresses is forwarded to the host side
 
 ### Registration changes
 
-Waywarp watches `conf.json` and checks the bridge every five seconds and after reconnects. Changed NAT rules are applied in one nftables transaction.
+Waywarp watches `conf.json` and kernel link/address notifications, reconciles the bridge during tunnel verification, and checks it every five seconds as a fallback. Changed NAT rules are applied in one nftables transaction.
 
 If the configuration is missing or malformed, Waywarp removes the routed-source exceptions and falls back to translation using the last verified targets. This also overrides `never` while the configuration is invalid.
 

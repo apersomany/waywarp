@@ -1,5 +1,6 @@
 // Bridge access: a dual-stack veth pair between the host and the private WARP namespace.
 pub mod nat;
+pub mod watch;
 
 use crate::tool;
 use crate::warp::LINK;
@@ -309,13 +310,14 @@ pub struct WarpLink {
 }
 
 impl WarpLink {
-    pub fn read() -> Result<Self> {
-        Self::parse(&tool::run("ip", &["-j", "address", "show", "dev", LINK])?)
+    pub fn read() -> Result<Option<Self>> {
+        Self::parse(&tool::run("ip", &["-j", "address", "show"])?)
     }
 
-    fn parse(contents: &str) -> Result<Self> {
+    fn parse(contents: &str) -> Result<Option<Self>> {
         #[derive(Deserialize)]
         struct Link {
+            ifname: String,
             mtu: u32,
             #[serde(default)]
             addr_info: Vec<Address>,
@@ -324,18 +326,17 @@ impl WarpLink {
         struct Address {
             local: IpAddr,
         }
-        let link = serde_json::from_str::<Vec<Link>>(contents)?
+        Ok(serde_json::from_str::<Vec<Link>>(contents)?
             .into_iter()
-            .next()
-            .context("WARP's link is absent")?;
-        Ok(Self {
-            mtu: link.mtu,
-            addresses: link
-                .addr_info
-                .into_iter()
-                .map(|address| address.local)
-                .collect(),
-        })
+            .find(|link| link.ifname == LINK)
+            .map(|link| Self {
+                mtu: link.mtu,
+                addresses: link
+                    .addr_info
+                    .into_iter()
+                    .map(|address| address.local)
+                    .collect(),
+            }))
     }
 
     pub fn reconcile(&self) -> Result<()> {
@@ -366,11 +367,11 @@ mod tests {
     }
 
     #[test]
-    fn warp_link_snapshot_is_typed_and_requires_a_link() {
+    fn warp_link_snapshot_is_typed_and_link_absence_is_normal() {
         let snapshot = WarpLink::parse(
-            r#"[{"mtu":1280,"addr_info":[{"local":"172.16.0.2"},{"local":"2001:db8::2"}]}]"#,
+            r#"[{"ifname":"lo","mtu":65536},{"ifname":"CloudflareWARP","mtu":1280,"addr_info":[{"local":"172.16.0.2"},{"local":"2001:db8::2"}]}]"#,
         )
-        .unwrap();
+        .unwrap().unwrap();
         assert_eq!(snapshot.mtu, 1280);
         assert_eq!(
             snapshot.addresses,
@@ -379,11 +380,22 @@ mod tests {
                 "2001:db8::2".parse().unwrap()
             ]
         );
-        assert!(WarpLink::parse("[]").is_err());
-        assert!(WarpLink::parse(r#"[{"mtu":null}]"#).is_err());
-        assert!(WarpLink::parse(r#"[{"mtu":1280,"addr_info":[{"local":"invalid"}]}]"#).is_err());
+        assert!(WarpLink::parse("[]").unwrap().is_none());
         assert!(
-            WarpLink::parse(r#"[{"mtu":1280}]"#)
+            WarpLink::parse(r#"[{"ifname":"lo","mtu":65536}]"#)
+                .unwrap()
+                .is_none()
+        );
+        assert!(WarpLink::parse(r#"[{"ifname":"CloudflareWARP","mtu":null}]"#).is_err());
+        assert!(
+            WarpLink::parse(
+                r#"[{"ifname":"CloudflareWARP","mtu":1280,"addr_info":[{"local":"invalid"}]}]"#
+            )
+            .is_err()
+        );
+        assert!(
+            WarpLink::parse(r#"[{"ifname":"CloudflareWARP","mtu":1280}]"#)
+                .unwrap()
                 .unwrap()
                 .addresses
                 .is_empty()

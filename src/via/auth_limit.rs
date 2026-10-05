@@ -1,20 +1,26 @@
 // Mudfish limits account logins, not UDP packets or nodes. Serialize and pace every SOCKS5
 // authentication in a user's store, across threads, instances, and supervisor restarts. The
 // runtime file contains only a monotonic timestamp; no account identifiers or credentials.
+use super::transport::check_cancelled;
+use crate::dataplane::Observer;
 use anyhow::{Context, Result, bail};
 use nix::libc;
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
-use std::thread;
 use std::time::Duration;
 
 // At most ten authentication attempts per minute, below Mudfish's reported 15–20 limit.
 const INTERVAL: Duration = Duration::from_secs(6);
+const LOCK_RETRY: Duration = Duration::from_millis(50);
 
-pub(super) fn run<T>(path: &Path, authenticate: impl FnOnce() -> Result<T>) -> Result<T> {
-    paced(path, INTERVAL, authenticate)
+pub(super) fn run<T>(
+    path: &Path,
+    observer: &Observer,
+    authenticate: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    paced(path, INTERVAL, observer, authenticate)
 }
 
 fn now() -> Result<Duration> {
@@ -41,8 +47,10 @@ fn stamp(file: &mut File) -> Result<()> {
 fn paced<T>(
     path: &Path,
     interval: Duration,
+    observer: &Observer,
     authenticate: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
+    check_cancelled(observer)?;
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -54,8 +62,18 @@ fn paced<T>(
         .context("opening the Mudfish authentication limiter")?;
     // Keep the lock through the exchange, so a slow login cannot overlap the next one.
     // Every caller opens its own descriptor: flock serializes threads as well as processes.
-    file.lock()
-        .context("locking the Mudfish authentication limiter")?;
+    loop {
+        check_cancelled(observer)?;
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(TryLockError::WouldBlock) => {
+                observer.wait_stopped(LOCK_RETRY);
+            }
+            Err(TryLockError::Error(error)) => {
+                return Err(error).context("locking the Mudfish authentication limiter");
+            }
+        }
+    }
     if file.metadata()?.len() > 32 {
         bail!("invalid Mudfish authentication timestamp");
     }
@@ -73,9 +91,10 @@ fn paced<T>(
         );
         let elapsed = now()?.checked_sub(previous).unwrap_or_default();
         if let Some(wait) = interval.checked_sub(elapsed) {
-            thread::sleep(wait);
+            observer.wait_stopped(wait);
         }
     }
+    check_cancelled(observer)?;
     // Count failures too, and retain a reservation if the process dies during authentication.
     stamp(&mut file)?;
     let result = authenticate();
@@ -86,32 +105,90 @@ fn paced<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempDirectory;
     use std::sync::{Arc, Barrier, Mutex};
-    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    use std::thread;
+    use std::time::Instant;
 
-    struct Directory(std::path::PathBuf);
+    struct Directory(TempDirectory);
 
     impl Directory {
         fn new() -> Self {
-            let nonce = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let path =
-                std::env::temp_dir().join(format!("waywarp-auth-{}-{nonce}", std::process::id()));
-            std::fs::create_dir(&path).unwrap();
-            Self(path)
+            Self(TempDirectory::new("auth"))
         }
-
         fn file(&self) -> std::path::PathBuf {
-            self.0.join("limit")
+            self.0.path.join("limit")
         }
     }
 
-    impl Drop for Directory {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+    #[test]
+    fn cancellation_during_pacing_releases_the_lock_without_reserving_a_login() {
+        let directory = Directory::new();
+        let path = directory.file();
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        stamp(&mut file).unwrap();
+        let timestamp = std::fs::read(&path).unwrap();
+        let observer = Observer::default();
+        let cancelled = observer.clone();
+        let (finished, result) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let authentication: Result<()> =
+                paced(&path, Duration::from_secs(3), &cancelled, || {
+                    bail!("authentication must not start")
+                });
+            finished.send(authentication).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match file.try_lock() {
+                Err(TryLockError::WouldBlock) => break,
+                Ok(()) => file.unlock().unwrap(),
+                Err(error) => panic!("{error}"),
+            }
+            assert!(Instant::now() < deadline, "pacing did not acquire the lock");
+            thread::sleep(Duration::from_millis(1));
         }
+        observer.stop();
+        let completed = result.recv_timeout(Duration::from_secs(1));
+        worker.join().unwrap();
+        assert_eq!(
+            completed.unwrap().unwrap_err().to_string(),
+            "relay operation was cancelled"
+        );
+        // Other tests can fork while the worker holds the descriptor, before CLOEXEC closes it.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(TryLockError::WouldBlock) => {}
+                Err(error) => panic!("{error}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cancellation did not release the lock"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(std::fs::read(directory.file()).unwrap(), timestamp);
+    }
+
+    #[test]
+    fn cancellation_before_authentication_does_not_create_the_limiter() {
+        let directory = Directory::new();
+        let observer = Observer::default();
+        observer.stop();
+        assert!(
+            run::<()>(&directory.file(), &observer, || panic!(
+                "must not authenticate"
+            ))
+            .is_err()
+        );
+        assert!(!directory.file().exists());
     }
 
     #[test]
@@ -126,10 +203,15 @@ mod tests {
                 let starts = Arc::clone(&starts);
                 scope.spawn(move || {
                     barrier.wait();
-                    paced(&path, Duration::from_millis(20), || {
-                        starts.lock().unwrap().push(Instant::now());
-                        Ok(())
-                    })
+                    paced(
+                        &path,
+                        Duration::from_millis(20),
+                        &Observer::default(),
+                        || {
+                            starts.lock().unwrap().push(Instant::now());
+                            Ok(())
+                        },
+                    )
                     .unwrap();
                 });
             }
@@ -148,14 +230,19 @@ mod tests {
             return;
         };
         let path = std::path::PathBuf::from(path);
-        paced(&path, Duration::from_millis(20), || {
-            let mut samples = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path.with_extension("samples"))?;
-            writeln!(samples, "{}", now()?.as_nanos())?;
-            Ok(())
-        })
+        paced(
+            &path,
+            Duration::from_millis(20),
+            &Observer::default(),
+            || {
+                let mut samples = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path.with_extension("samples"))?;
+                writeln!(samples, "{}", now()?.as_nanos())?;
+                Ok(())
+            },
+        )
         .unwrap();
     }
 
@@ -194,12 +281,12 @@ mod tests {
         let directory = Directory::new();
         let interval = Duration::from_millis(20);
         let mut failed_at = None;
-        let result: Result<()> = paced(&directory.file(), interval, || {
+        let result: Result<()> = paced(&directory.file(), interval, &Observer::default(), || {
             failed_at = Some(Instant::now());
             bail!("rejected")
         });
         assert!(result.is_err());
-        paced(&directory.file(), interval, || {
+        paced(&directory.file(), interval, &Observer::default(), || {
             assert!(failed_at.unwrap().elapsed() >= interval);
             Ok(())
         })
@@ -211,9 +298,12 @@ mod tests {
         let directory = Directory::new();
         std::fs::write(directory.file(), "not a timestamp").unwrap();
         assert!(
-            paced::<()>(&directory.file(), Duration::ZERO, || panic!(
-                "must not authenticate"
-            ))
+            paced::<()>(
+                &directory.file(),
+                Duration::ZERO,
+                &Observer::default(),
+                || panic!("must not authenticate")
+            )
             .is_err()
         );
     }
@@ -221,13 +311,16 @@ mod tests {
     #[test]
     fn symlinks_are_not_followed() {
         let directory = Directory::new();
-        let target = directory.0.join("target");
+        let target = directory.0.path.join("target");
         std::fs::write(&target, "unchanged").unwrap();
         std::os::unix::fs::symlink(&target, directory.file()).unwrap();
         assert!(
-            paced::<()>(&directory.file(), Duration::ZERO, || panic!(
-                "must not authenticate"
-            ))
+            paced::<()>(
+                &directory.file(),
+                Duration::ZERO,
+                &Observer::default(),
+                || panic!("must not authenticate")
+            )
             .is_err()
         );
         assert_eq!(std::fs::read_to_string(target).unwrap(), "unchanged");

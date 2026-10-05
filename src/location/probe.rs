@@ -2,8 +2,8 @@
 use crate::http::Request;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
 
 const URL: &str = "https://engage.cloudflareclient.com/cdn-cgi/trace";
 // Pinned addresses keep each probe on one family and avoid proxy DNS ambiguity.
@@ -23,14 +23,8 @@ pub struct Probe {
     pub address: IpAddr,
 }
 
-impl fmt::Display for Probe {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}/{}", self.colo, self.address)
-    }
-}
-
 // Requests the trace endpoint through a SOCKS5 proxy, or through the calling thread's routes.
-pub fn probe(family: Family, proxy: Option<SocketAddr>) -> Result<Probe> {
+pub fn probe(family: Family, proxy: Option<SocketAddr>, timeout: Duration) -> Result<Probe> {
     let body = Request {
         address: Some(match family {
             Family::V4 => PROBE4,
@@ -39,7 +33,7 @@ pub fn probe(family: Family, proxy: Option<SocketAddr>) -> Result<Probe> {
         proxy,
         ..Request::new(URL, 16 * 1024)
     }
-    .get()?;
+    .get_with_timeout(timeout)?;
     let probe = parse(&String::from_utf8(body)?)?;
     if probe.address.is_ipv6() != (family == Family::V6) {
         bail!("the {family:?} location probe returned {}", probe.address);
@@ -72,7 +66,8 @@ mod tests {
         let probe =
             parse("fl=1\nh=engage.cloudflareclient.com\nip=104.28.211.30\ncolo=nrt\nwarp=on\n")
                 .unwrap();
-        assert_eq!(probe.to_string(), "NRT/104.28.211.30");
+        assert_eq!(probe.colo, "NRT");
+        assert_eq!(probe.address, "104.28.211.30".parse::<IpAddr>().unwrap());
         assert!(parse("ip=104.28.211.30\n").is_err());
     }
 }

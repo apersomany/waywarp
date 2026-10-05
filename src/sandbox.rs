@@ -189,7 +189,7 @@ pub fn tun() -> Result<File> {
 
 // Network namespaces are per thread, and a rootless process cannot switch back to the host stack,
 // so each private task runs on its own short-lived thread that enters and never leaves. Links,
-// sockets, and processes created there keep the namespace. A parked anchor thread stays inside so
+// sockets, and processes created there keep the namespace. An owned anchor stays inside so
 // the namespace has a path that tools such as `ip` can name.
 #[derive(Clone)]
 pub struct Private(Arc<Namespace>);
@@ -197,12 +197,24 @@ pub struct Private(Arc<Namespace>);
 struct Namespace {
     descriptor: OwnedFd,
     path: PathBuf,
+    lifetime: Option<mpsc::Sender<()>>,
+    owner: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for Namespace {
+    fn drop(&mut self) {
+        self.lifetime.take();
+        if let Some(owner) = self.owner.take() {
+            let _ = owner.join();
+        }
+    }
 }
 
 impl Private {
     pub fn create() -> Result<Self> {
         let (sender, receiver) = mpsc::channel();
-        thread::Builder::new()
+        let (alive, lifetime) = mpsc::channel();
+        let owner = thread::Builder::new()
             .name("namespace".into())
             .spawn(move || {
                 let entered = unshare(CloneFlags::CLONE_NEWNET)
@@ -211,18 +223,18 @@ impl Private {
                         let descriptor = File::open("/proc/thread-self/ns/net")?;
                         Ok((descriptor, nix::unistd::gettid()))
                     });
-                let parked = entered.is_ok();
+                let anchored = entered.is_ok();
                 let _ = sender.send(entered);
-                if parked {
-                    loop {
-                        thread::park();
-                    }
+                if anchored {
+                    let _ = lifetime.recv();
                 }
             })?;
         let (descriptor, thread) = receiver.recv()??;
         Ok(Self(Arc::new(Namespace {
             descriptor: descriptor.into(),
             path: format!("/proc/{}/task/{thread}/ns/net", std::process::id()).into(),
+            lifetime: Some(alive),
+            owner: Some(owner),
         })))
     }
 
@@ -259,5 +271,31 @@ impl Private {
                 .join()
                 .map_err(|_| anyhow::anyhow!("private namespace task panicked"))?
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_last_namespace_handle_releases_and_joins_the_anchor() {
+        let (alive, lifetime) = mpsc::channel();
+        let (finished, done) = mpsc::channel();
+        let owner = thread::spawn(move || {
+            let _ = lifetime.recv();
+            finished.send(()).unwrap();
+        });
+        let private = Private(Arc::new(Namespace {
+            descriptor: File::open("/dev/null").unwrap().into(),
+            path: PathBuf::new(),
+            lifetime: Some(alive),
+            owner: Some(owner),
+        }));
+        let last = private.clone();
+        drop(private);
+        assert!(done.try_recv().is_err());
+        drop(last);
+        done.try_recv().unwrap();
     }
 }

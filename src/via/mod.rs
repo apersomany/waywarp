@@ -3,6 +3,7 @@ pub mod interface;
 pub mod mudfish;
 pub mod ping;
 pub mod socks5;
+mod transport;
 
 use anyhow::{Result, bail};
 use mudfish::Filter;
@@ -167,51 +168,63 @@ pub fn validate(via: &[Via]) -> Result<()> {
     Ok(())
 }
 
-// Expands the ordered --via list into the routes to try. Mudfish filters expand in place from a
-// freshly fetched node list, so every bootstrap sees current nodes.
-pub fn expand(via: &[Via], credentials: &Credentials, mudfish_port: u16) -> Result<Vec<Route>> {
+// Expand one entry only when it is reached, so an unavailable later provider cannot prevent
+// earlier routes from succeeding. A bootstrap shares one freshly fetched Mudfish node list.
+pub fn expand<'a>(
+    via: &'a [Via],
+    credentials: &'a Credentials,
+    mudfish_port: u16,
+) -> impl Iterator<Item = (&'a Via, Result<Vec<Route>>)> {
+    expand_with(via, credentials, mudfish_port, mudfish::nodes)
+}
+
+fn expand_with<'a>(
+    via: &'a [Via],
+    credentials: &'a Credentials,
+    mudfish_port: u16,
+    mut load_nodes: impl FnMut() -> Result<Vec<mudfish::Node>> + 'a,
+) -> impl Iterator<Item = (&'a Via, Result<Vec<Route>>)> {
     let mut nodes = None;
     let seed = seed();
-    let mut routes = Vec::new();
-    for entry in via {
-        match entry {
-            Via::Direct => routes.push(Route::Direct),
-            Via::Socks5(server) => routes.push(Route::Relay(Relay {
-                label: server.to_string(),
-                server: *server,
-                login: credentials.socks5.clone(),
-            })),
-            Via::Mudfish(filter) => {
-                let nodes = match &mut nodes {
-                    Some(nodes) => nodes,
-                    None => nodes.insert(mudfish::nodes()?),
-                };
-                let before = routes.len();
-                let matched = nodes.iter().filter(|node| filter.matches(node));
-                routes.extend(
-                    mudfish::spread(matched, seed)
-                        .into_iter()
-                        .filter_map(|node| {
-                            let IpAddr::V4(ip) = node.ip else {
-                                return None;
-                            };
-                            Some(Route::Relay(Relay {
-                                label: node.location.to_string(),
-                                server: SocketAddrV4::new(ip, mudfish_port),
-                                login: credentials.mudfish.clone(),
-                            }))
-                        }),
-                );
-                if routes.len() == before {
-                    bail!("no IPv4 Mudfish node matches {filter}");
-                }
-            }
-        }
-    }
-    if routes.is_empty() {
-        routes.push(Route::Direct);
-    }
-    Ok(routes)
+    via.iter()
+        .chain(via.is_empty().then_some(&Via::Direct))
+        .map(move |entry| {
+            let routes = (|| {
+                Ok(match entry {
+                    Via::Direct => vec![Route::Direct],
+                    Via::Socks5(server) => vec![Route::Relay(Relay {
+                        label: server.to_string(),
+                        server: *server,
+                        login: credentials.socks5.clone(),
+                    })],
+                    Via::Mudfish(filter) => {
+                        let nodes = match &mut nodes {
+                            Some(nodes) => nodes,
+                            None => nodes.insert(load_nodes()?),
+                        };
+                        let matched = nodes.iter().filter(|node| filter.matches(node));
+                        let routes: Vec<_> = mudfish::spread(matched, seed)
+                            .into_iter()
+                            .filter_map(|node| {
+                                let IpAddr::V4(ip) = node.ip else {
+                                    return None;
+                                };
+                                Some(Route::Relay(Relay {
+                                    label: node.location.to_string(),
+                                    server: SocketAddrV4::new(ip, mudfish_port),
+                                    login: credentials.mudfish.clone(),
+                                }))
+                            })
+                            .collect();
+                        if routes.is_empty() {
+                            bail!("no IPv4 Mudfish node matches {filter}");
+                        }
+                        routes
+                    }
+                })
+            })();
+            (entry, routes)
+        })
 }
 
 // Varies relay order and ping connection IDs between runs; not used for anything secret.
@@ -223,6 +236,74 @@ pub fn seed() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn later_providers_are_not_loaded_before_earlier_routes() {
+        use std::cell::Cell;
+
+        for first in [Via::Direct, Via::Socks5("192.0.2.1:1080".parse().unwrap())] {
+            let via = [first, "mudfish:country=jp".parse().unwrap(), Via::Direct];
+            let credentials = Credentials::default();
+            let loads = Cell::new(0);
+            let mut entries = expand_with(&via, &credentials, 18081, || {
+                loads.set(loads.get() + 1);
+                bail!("provider unavailable")
+            });
+            assert_eq!(loads.get(), 0);
+            assert!(entries.next().unwrap().1.is_ok());
+            assert_eq!(loads.get(), 0);
+            assert_eq!(
+                entries.next().unwrap().1.unwrap_err().to_string(),
+                "provider unavailable"
+            );
+            assert_eq!(loads.get(), 1);
+            assert!(matches!(
+                entries.next().unwrap().1.unwrap()[0],
+                Route::Direct
+            ));
+            assert!(entries.next().is_none());
+        }
+    }
+
+    #[test]
+    fn node_lists_are_shared_and_empty_matches_leave_later_entries_available() {
+        use std::cell::Cell;
+
+        let via = [
+            "mudfish:country=jp".parse().unwrap(),
+            "mudfish:country=us".parse().unwrap(),
+            Via::Direct,
+        ];
+        let credentials = Credentials::default();
+        let loads = Cell::new(0);
+        let mut entries = expand_with(&via, &credentials, 1234, || {
+            loads.set(loads.get() + 1);
+            Ok(vec![mudfish::Node {
+                location: "JP Asia (Tokyo - Provider)".to_owned().into(),
+                ip: "192.0.2.1".parse().unwrap(),
+                id: 1,
+            }])
+        });
+        let routes = entries.next().unwrap().1.unwrap();
+        let Route::Relay(relay) = &routes[0] else {
+            panic!("expected relay");
+        };
+        assert_eq!(relay.server, "192.0.2.1:1234".parse().unwrap());
+        assert!(entries.next().unwrap().1.is_err());
+        assert!(matches!(
+            entries.next().unwrap().1.unwrap()[0],
+            Route::Direct
+        ));
+        assert_eq!(loads.get(), 1);
+        assert!(matches!(
+            expand_with(&[], &credentials, 18081, || panic!("must not fetch nodes"))
+                .next()
+                .unwrap()
+                .1
+                .unwrap()[0],
+            Route::Direct
+        ));
+    }
 
     #[test]
     fn socks5_accepts_pasted_uris_but_not_credentials() {

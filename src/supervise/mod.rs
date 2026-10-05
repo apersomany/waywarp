@@ -1,72 +1,158 @@
-// The supervisor owns one instance for its whole life: namespaces, TUN, veth, data plane, and
-// warp-svc all go away with it.
+// The supervisor owns one instance's namespaces, forwarding, bridge, and WARP daemon.
 mod bootstrap;
 mod bridge;
 mod control;
 
-use crate::dataplane::{self, Frontends};
+use crate::dataplane::{self, Frontends, Generation, Observer};
 use crate::ipc::{Channel, Listener};
 use crate::location::Locations;
 use crate::location::geofeed::Geofeed;
 use crate::notify::Notifier;
-use crate::protocol::{Access, Event, Plan, Status};
+use crate::output;
+use crate::protocol::{Access, Event, Failure, Plan, Progress, Status};
 use crate::sandbox::{self, Private};
-use crate::store::Lock;
+use crate::store::{Lock, Name};
+use crate::via::Route;
 use crate::warp::{self, Daemon, Monitor, State};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use bridge::Bridge;
 use nix::sys::signal::{SigSet, Signal};
 use std::net::TcpListener;
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use tracing::{error, info, warn};
 
 enum Stop {
-    Requested,
-    Failed(String),
+    // Holding the request channel until cleanup finishes makes EOF a shutdown acknowledgment.
+    Requested(Option<Channel>),
+    Failed(anyhow::Error),
 }
 
-// Where setup progress goes: to the waiting `up` client, or to the log in the foreground.
+#[derive(Clone)]
+struct Stopper {
+    sender: mpsc::Sender<Stop>,
+    observer: Observer,
+    monitor: Monitor,
+}
+
+impl Stopper {
+    fn new(sender: mpsc::Sender<Stop>) -> Self {
+        let observer = Observer::default();
+        let changed = observer.clone();
+        let monitor = Monitor::new(move || changed.control_changed());
+        Self {
+            sender,
+            observer,
+            monitor,
+        }
+    }
+
+    fn request(&self, reason: Stop) {
+        let _ = self.sender.send(reason);
+        self.cancel();
+    }
+
+    fn cancel(&self) {
+        self.observer.stop();
+        self.monitor.cancel();
+    }
+
+    fn check(&self) -> Result<()> {
+        if self.observer.stopped() {
+            bail!("instance setup was cancelled");
+        }
+        Ok(())
+    }
+}
+
 pub enum Reporter {
     Client(Channel),
     Foreground(Notifier),
 }
 
 impl Reporter {
-    fn progress(&self, message: String) {
-        info!("{message}");
-        if let Self::Client(channel) = self {
-            let _ = channel.send(&Event::Progress(message), &[]);
+    fn progress(&self, index: u8, name: Option<&Name>, progress: Progress) {
+        match self {
+            Self::Client(channel) => {
+                output::progress(index, name, &progress);
+                let _ = channel.send(&Event::Progress(progress), &[]);
+            }
+            Self::Foreground(_) => output::progress(index, name, &progress),
         }
     }
 
     fn up(&self, status: &Status) -> Result<()> {
-        info!("{status}");
+        if !status.healthy() {
+            bail!("WARP changed before the instance became ready");
+        }
         match self {
-            Self::Client(channel) => channel.send(&Event::Up(Box::new(status.clone())), &[]),
+            Self::Client(channel) => {
+                let instance_name = status.name.as_ref().map(ToString::to_string);
+                info!(target: output::LIFECYCLE_TARGET, instance = status.index,
+                    instance_name = instance_name.as_deref(),
+                    status = %output::summary(status), "instance ready");
+                channel.send(&Event::Up(Box::new(status.clone())), &[])
+            }
             Self::Foreground(notifier) => {
-                println!("{status}");
-                notifier.ready(&status.to_string());
+                output::ready(status, None)?;
+                notifier.ready(&output::summary(status));
                 Ok(())
             }
         }
     }
 
-    fn failed(&self, reason: String) {
-        error!("setup failed: {reason}");
+    fn failed(&self, failure: &anyhow::Error) {
         if let Self::Client(channel) = self {
-            let _ = channel.send(&Event::Failed(reason), &[]);
+            error!("setup failed: {failure:#}");
+            let _ = channel.send(&Event::Failed(Failure::from(failure)), &[]);
         }
     }
 }
 
-type Report<'a> = &'a (dyn Fn(String) + Sync);
+type Report<'a> = &'a (dyn Fn(Progress) + Sync);
 
-// Everything an instance owns at runtime. Background threads share it until the process exits,
-// so `shutdown` is explicit; anything it misses the kernel reclaims when the process ends.
+#[derive(Default)]
+struct Observation {
+    generation: Option<Generation>,
+    locations: Locations,
+    relay: Option<String>,
+    matched: bool,
+    rebootstraps: u32,
+}
+
+impl Observation {
+    fn publish(
+        &mut self,
+        observer: &Observer,
+        verified: bootstrap::Verified,
+        matched: bool,
+    ) -> bool {
+        if !observer.confirm(verified.generation) {
+            return false;
+        }
+        self.generation = Some(verified.generation);
+        self.locations = verified.locations;
+        self.matched = matched;
+        true
+    }
+
+    fn state(&self, observer: &Observer, state: State, sequence: u64) -> State {
+        let current = self.generation.is_some_and(|generation| {
+            !observer.stopped()
+                && generation == observer.generation()
+                && generation.control == sequence
+        });
+        if state == State::Connected && !current {
+            State::Degraded
+        } else {
+            state
+        }
+    }
+}
+
 struct Supervisor {
     plan: Plan,
     private: Private,
@@ -75,7 +161,7 @@ struct Supervisor {
     daemon: Mutex<Option<Daemon>>,
     geofeed: Option<Geofeed>,
     bridge: Option<Bridge>,
-    status: Mutex<Status>,
+    observation: Mutex<Observation>,
 }
 
 impl Supervisor {
@@ -84,24 +170,52 @@ impl Supervisor {
     }
 
     fn status(&self) -> Status {
-        let mut status = self.status.lock().unwrap().clone();
-        status.state = self.monitor.state();
-        status.nat = self.bridge.as_ref().and_then(Bridge::policy);
-        status
+        let observation = self.observation.lock().unwrap();
+        let (state, sequence) = self.monitor.snapshot();
+        let state = observation.state(&self.dataplane.observer, state, sequence);
+        Status {
+            index: self.plan.instance.index,
+            name: self.plan.name.clone(),
+            access: self.plan.access.clone(),
+            state,
+            locations: observation.locations.clone(),
+            relay: observation.relay.clone(),
+            matched: observation.matched && state == State::Connected,
+            rebootstraps: observation.rebootstraps,
+            nat: self.bridge.as_ref().and_then(Bridge::policy),
+        }
     }
 
-    fn reconcile_bridge(&self) -> Result<()> {
+    fn publish(&self, verified: bootstrap::Verified, matched: bool, route: Option<&Route>) -> bool {
+        let mut observation = self.observation.lock().unwrap();
+        let (state, sequence) = self.monitor.snapshot();
+        if state != State::Connected
+            || sequence != verified.generation.control
+            || !observation.publish(&self.dataplane.observer, verified, matched)
+        {
+            return false;
+        }
+        if let Some(route) = route {
+            observation.relay = match route {
+                Route::Direct => None,
+                Route::Relay(relay) => Some(relay.label.clone()),
+            };
+        }
+        true
+    }
+
+    fn reconcile_bridge(&self) -> Result<bool> {
         match &self.bridge {
             Some(bridge) => bridge
                 .reconcile()
                 .context("reconciling the bridge with WARP"),
-            None => Ok(()),
+            None => Ok(true),
         }
     }
 
     fn shutdown(&self) {
-        self.monitor.stop();
         self.dataplane.stop();
+        self.monitor.stop();
         self.daemon.lock().unwrap().take();
         if let Some(bridge) = &self.bridge {
             bridge.stop();
@@ -115,11 +229,32 @@ impl Drop for Supervisor {
     }
 }
 
-// Entry point of a detached supervisor: the plan, the instance lock, and any proxy listener
-// arrive on stdin from `up`.
+struct Running {
+    supervisor: Arc<Supervisor>,
+    workers: Vec<JoinHandle<()>>,
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.supervisor.shutdown();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+        let _ = std::fs::remove_file(self.supervisor.plan.instance.control());
+    }
+}
+
 pub fn detached() -> Result<()> {
     let setup = Channel::from(std::io::stdin().as_fd().try_clone_to_owned()?);
     let (plan, descriptors): (Plan, Vec<OwnedFd>) = setup.expect()?;
+    let expected = if matches!(plan.access, Access::Proxy { .. }) {
+        2
+    } else {
+        1
+    };
+    if descriptors.len() != expected {
+        bail!("expected {expected} setup descriptors");
+    }
     let mut descriptors = descriptors.into_iter();
     let lock = Lock::from(
         descriptors
@@ -130,75 +265,93 @@ pub fn detached() -> Result<()> {
     run(plan, lock, listener, Reporter::Client(setup))
 }
 
-// Must start while the process is single-threaded; returns once the instance stops.
+// Isolation precedes every thread because user namespaces require a single-threaded process.
 pub fn run(
     plan: Plan,
     _lock: Lock,
     listener: Option<TcpListener>,
     reporter: Reporter,
 ) -> Result<()> {
-    // Blocked before any thread starts so every thread inherits the mask and one waits for them.
     let mut signals = SigSet::empty();
     for signal in [Signal::SIGTERM, Signal::SIGINT, Signal::SIGHUP] {
         signals.add(signal);
     }
     signals.thread_block()?;
-    info!(index = plan.instance.index, access = %plan.access, "starting instance");
-    let control = plan.instance.control();
-    let (stop, stopped) = mpsc::channel();
-    let serving = Arc::new(AtomicBool::new(false));
-    // User namespaces can only be entered while single-threaded, so isolation precedes every thread.
-    let started = sandbox::isolate(&plan.instance)
-        .and_then(|()| watch(signals, &serving, &stop, &reporter))
-        .and_then(|()| start(plan, listener, &stop, &|message| reporter.progress(message)))
-        .and_then(|supervisor| {
-            let _ = std::fs::remove_file(&control);
-            let listener = Listener::bind(&control).context("binding the control socket")?;
-            Ok((supervisor, listener))
-        });
-    let (supervisor, listener) = match started {
-        Ok(started) => started,
+    let (index, name) = (plan.instance.index, plan.name.clone());
+    let instance_name = name.as_ref().map(ToString::to_string);
+    info!(target: output::LIFECYCLE_TARGET, instance = index,
+        instance_name = instance_name.as_deref(), access = %plan.access, "starting instance");
+    let (sender, stopped) = mpsc::channel();
+    let stop = Stopper::new(sender);
+    let ready = Arc::new(AtomicBool::new(false));
+    let started = (|| -> Result<Running> {
+        sandbox::isolate(&plan.instance)?;
+        watch(signals, &ready, &stop, &reporter)?;
+        let supervisor = start(plan, listener, &stop, &|progress| {
+            reporter.progress(index, name.as_ref(), progress)
+        })?;
+        let mut running = Running {
+            supervisor: Arc::new(supervisor),
+            workers: Vec::new(),
+        };
+        let control = running.supervisor.plan.instance.control();
+        let _ = std::fs::remove_file(&control);
+        let listener = Listener::bind(&control).context("binding the control socket")?;
+        if let Some(worker) = bridge::watch(&running.supervisor, &stop)? {
+            running.workers.push(worker);
+        }
+        running
+            .workers
+            .push(recheck_on_reconnect(&running.supervisor, &stop)?);
+        running
+            .workers
+            .push(control::serve(listener, &running.supervisor, &stop)?);
+        stop.check()?;
+        ready.store(true, Ordering::SeqCst);
+        reporter.up(&running.supervisor.status())?;
+        Ok(running)
+    })();
+    let running = match started {
+        Ok(running) => running,
         Err(failure) => {
-            let reason = format!("{failure:#}");
-            reporter.failed(reason.clone());
+            stop.cancel();
+            let failure = match stopped.try_recv() {
+                Ok(Stop::Requested(_channel)) => return Ok(()),
+                Ok(Stop::Failed(error)) => error,
+                Err(_) => failure,
+            };
+            reporter.failed(&failure);
             return match reporter {
                 Reporter::Client(_) => Ok(()),
                 Reporter::Foreground(_) => Err(failure),
             };
         }
     };
-    serving.store(true, Ordering::SeqCst);
-    reporter.up(&supervisor.status())?;
     drop(reporter);
-    let supervisor = Arc::new(supervisor);
-    bridge::watch(&supervisor, &stop)?;
-    recheck_on_reconnect(&supervisor, &stop)?;
-    control::serve(listener, &supervisor, &stop)?;
-    let reason = stopped.recv().unwrap_or(Stop::Requested);
-    let _ = std::fs::remove_file(&control);
-    supervisor.shutdown();
+    let reason = stopped.recv().unwrap_or(Stop::Requested(None));
+    drop(running);
     match reason {
-        Stop::Requested => {
-            info!("instance stopped");
+        Stop::Requested(_channel) => {
+            info!(target: output::LIFECYCLE_TARGET, instance = index,
+                instance_name = instance_name.as_deref(), "stopped");
             Ok(())
         }
-        Stop::Failed(reason) => {
-            error!("instance failed: {reason}");
-            bail!("{reason}")
-        }
+        Stop::Failed(error) => Err(error),
     }
 }
 
 fn start(
     plan: Plan,
     listener: Option<TcpListener>,
-    stop: &mpsc::Sender<Stop>,
+    stop: &Stopper,
     report: Report,
 ) -> Result<Supervisor> {
+    stop.check()?;
     if !warp::registered() {
-        report("registering a WARP device".into());
-        warp::register(plan.accept_tos)?;
+        report(Progress::Registering);
+        warp::register(plan.accept_tos, &stop.observer)?;
     }
+    stop.check()?;
     let geofeed = match Geofeed::load(&plan.instance.store) {
         Ok(geofeed) => Some(geofeed),
         Err(error) if plan.location.constrains_geo() => {
@@ -209,6 +362,7 @@ fn start(
             None
         }
     };
+    stop.check()?;
     plan.location.validate(geofeed.as_ref())?;
     let private = Private::create()?;
     let tun = private.run(sandbox::tun)?;
@@ -221,7 +375,7 @@ fn start(
         (Access::Proxy { .. }, Some(listener)) => {
             let private = private.clone();
             let connect: dataplane::Connect = Box::new(move || {
-                private.run(|| Ok(std::net::TcpStream::connect(warp::proxy_address())?))
+                private.run(|| crate::via::interface::connect_tcp(warp::proxy_address()))
             });
             Some((listener, connect))
         }
@@ -235,118 +389,191 @@ fn start(
         tun,
         plan.interface.clone(),
         Frontends { proxy, redirect },
+        stop.observer.clone(),
         move |result| {
-            let reason = result.err().map_or_else(
-                || "the data plane stopped".into(),
-                |error| format!("the data plane failed: {error:#}"),
-            );
-            let _ = failed.send(Stop::Failed(reason));
+            if !failed.observer.stopped() {
+                let error = result.err().map_or_else(
+                    || anyhow!("the data plane stopped"),
+                    |error| error.context("the data plane failed"),
+                );
+                failed.request(Stop::Failed(error));
+            }
         },
     )?;
-    let status = Status {
-        index: plan.instance.index,
-        name: plan.name.clone(),
-        access: plan.access.clone(),
-        state: State::Unknown,
-        locations: Locations::default(),
-        relay: None,
-        matched: true,
-        rebootstraps: 0,
-        nat: None,
-    };
-    let monitor = Monitor::start(&private)?;
     let mut supervisor = Supervisor {
         plan,
         private,
         dataplane,
-        monitor,
+        monitor: stop.monitor.clone(),
         daemon: Mutex::new(None),
         geofeed,
         bridge: None,
-        status: Mutex::new(status),
+        observation: Mutex::new(Observation::default()),
     };
-    supervisor.bridge = Bridge::attach(&supervisor.plan, &supervisor.private)?;
-    report("starting warp-svc".into());
+    supervisor.monitor.start(&supervisor.private)?;
+    stop.check()?;
+    supervisor.bridge = Bridge::attach(
+        &supervisor.plan,
+        &supervisor.private,
+        &supervisor.dataplane.observer,
+    )?;
+    stop.check()?;
+    report(Progress::StartingDaemon);
     let exited = stop.clone();
-    let daemon = Daemon::start(&supervisor.private, move |status| {
-        let _ = exited.send(Stop::Failed(format!("warp-svc exited ({status})")));
+    let daemon = Daemon::start(&supervisor.private, &stop.observer, move |status| {
+        if !exited.observer.stopped() {
+            exited.request(Stop::Failed(anyhow!("warp-svc exited ({status})")));
+        }
     })?;
     *supervisor.daemon.lock().unwrap() = Some(daemon);
+    stop.check()?;
     let (edge, proxy) = (supervisor.plan.edge, supervisor.proxy());
-    supervisor.private.run(|| warp::configure(edge, proxy))?;
+    supervisor
+        .private
+        .run(|| warp::configure(edge, proxy, &stop.observer))?;
     bootstrap::bootstrap(&supervisor, report)?;
-    supervisor.reconcile_bridge()?;
+    stop.check()?;
     Ok(supervisor)
 }
 
-// Rechecks required locations after every Connected event. Migration is checked synchronously by
-// the bootstrap, so no timer is needed.
-fn recheck_on_reconnect(supervisor: &Arc<Supervisor>, stop: &mpsc::Sender<Stop>) -> Result<()> {
+fn recheck_on_reconnect(supervisor: &Arc<Supervisor>, stop: &Stopper) -> Result<JoinHandle<()>> {
     let (supervisor, failed) = (Arc::clone(supervisor), stop.clone());
-    thread::Builder::new()
+    Ok(thread::Builder::new()
         .name("recheck".into())
         .spawn(move || {
-            let monitor = &supervisor.monitor;
-            let mut since = monitor.sequence();
-            while !monitor.stopped() {
-                let connected = monitor.wait(since, Duration::from_secs(3600), |state| {
-                    *state == State::Connected
-                });
-                if connected.is_none() {
+            let observer = &supervisor.dataplane.observer;
+            while !observer.stopped() {
+                let Some(generation) = observer.pending(Duration::from_secs(3600)) else {
                     continue;
-                }
-                // warp-svc recreates its link when it reconnects, removing the bridge route.
-                // Restore it before the recheck, whose location probes can take a while, and
-                // again after it, since a rebootstrap reconnects without raising this wait.
-                let routed = supervisor
-                    .reconcile_bridge()
-                    .and_then(|()| bootstrap::recheck(&supervisor))
-                    .and_then(|()| supervisor.reconcile_bridge());
-                if let Err(error) = routed {
-                    let _ = failed.send(Stop::Failed(format!("{error:#}")));
+                };
+                if let Err(error) = bootstrap::recheck(&supervisor) {
+                    failed.request(Stop::Failed(error));
                     return;
                 }
-                // Events raised by a rebootstrap describe the new tunnel, which is already checked.
-                since = monitor.sequence();
+                observer.wait_change(generation, Duration::from_secs(1));
             }
-        })?;
-    Ok(())
+        })?)
 }
 
-// Before the instance is up, a signal or the `up` client going away abandons setup by exiting:
-// the kernel then releases the namespaces, TUN, and veth, and warp-svc dies with its owner thread.
 fn watch(
     signals: SigSet,
-    serving: &Arc<AtomicBool>,
-    stop: &mpsc::Sender<Stop>,
+    ready: &Arc<AtomicBool>,
+    stop: &Stopper,
     reporter: &Reporter,
 ) -> Result<()> {
-    let (serving_signal, signal_stop) = (Arc::clone(serving), stop.clone());
+    let signal_stop = stop.clone();
     thread::Builder::new()
         .name("signals".into())
-        .spawn(move || {
-            loop {
-                let signal = signals.wait();
-                if !serving_signal.load(Ordering::SeqCst) {
-                    warn!(?signal, "setup interrupted");
-                    std::process::exit(1);
-                }
+        .spawn(move || match signals.wait() {
+            Ok(signal) => {
                 info!(?signal, "stopping");
-                let _ = signal_stop.send(Stop::Requested);
+                signal_stop.request(Stop::Requested(None));
             }
+            Err(error) => signal_stop.request(Stop::Failed(error.into())),
         })?;
     if let Reporter::Client(channel) = reporter {
         let client = channel.try_clone()?;
-        let serving = Arc::clone(serving);
+        client.set_timeout(Some(Duration::from_millis(100)))?;
+        let (ready, stop) = (Arc::clone(ready), stop.clone());
         thread::Builder::new()
             .name("setup-client".into())
             .spawn(move || {
-                while let Ok(Some(_)) = client.receive::<serde_json::Value>() {}
-                if !serving.load(Ordering::SeqCst) {
-                    warn!("setup abandoned by the client");
-                    std::process::exit(1);
+                while !ready.load(Ordering::SeqCst) && !stop.observer.stopped() {
+                    match client.receive::<serde_json::Value>() {
+                        Ok(Some(_)) => {}
+                        Err(error)
+                            if error.downcast_ref::<nix::errno::Errno>()
+                                == Some(&nix::errno::Errno::EAGAIN) => {}
+                        _ => {
+                            // Ready may have been published while this receive was blocked.
+                            if !ready.load(Ordering::SeqCst) && !stop.observer.stopped() {
+                                warn!("setup abandoned by the client");
+                                stop.request(Stop::Requested(None));
+                            }
+                            return;
+                        }
+                    }
                 }
             })?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancellation_wakes_waiters_and_holds_the_shutdown_acknowledgment() {
+        let (sender, reasons) = mpsc::channel();
+        let stop = Stopper::new(sender);
+        let (request, client) = Channel::pair().unwrap();
+        client.set_timeout(Some(Duration::from_millis(10))).unwrap();
+        stop.request(Stop::Requested(Some(request)));
+        let reason = reasons.recv().unwrap();
+        assert!(stop.observer.stopped());
+        assert!(
+            stop.monitor
+                .wait(0, Duration::from_secs(60), |_| true)
+                .is_none()
+        );
+        assert!(client.receive::<serde_json::Value>().is_err());
+        drop(reason);
+        assert!(client.receive::<serde_json::Value>().unwrap().is_none());
+    }
+
+    #[test]
+    fn stale_results_are_not_published_or_reported_healthy() {
+        let observer = Observer::default();
+        let generation = observer.generation();
+        let mut observation = Observation::default();
+        observer.control_changed();
+        assert!(!observation.publish(
+            &observer,
+            bootstrap::Verified {
+                generation,
+                locations: Locations {
+                    edge: "OLD".into(),
+                    ..Locations::default()
+                },
+            },
+            true
+        ));
+        assert!(observation.locations.edge.is_empty());
+        let generation = observer.generation();
+        assert!(observation.publish(
+            &observer,
+            bootstrap::Verified {
+                generation,
+                locations: Locations {
+                    edge: "NEW".into(),
+                    ..Locations::default()
+                },
+            },
+            true
+        ));
+        assert_eq!(
+            observation.state(&observer, State::Connected, generation.control),
+            State::Connected
+        );
+        // Fence the interval between the daemon publishing its state and notifying the observer.
+        assert_eq!(
+            observation.state(&observer, State::Connected, generation.control + 1),
+            State::Degraded
+        );
+        observer.link_changed();
+        assert_eq!(
+            observation.state(&observer, State::Connected, generation.control),
+            State::Degraded
+        );
+        observer.stop();
+        assert!(!observation.publish(
+            &observer,
+            bootstrap::Verified {
+                generation: observer.generation(),
+                locations: Locations::default(),
+            },
+            true
+        ));
+    }
 }

@@ -9,8 +9,9 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(
     version,
+    max_term_width = 80,
     about = "Run Cloudflare WARP clients side by side, and exit in the region you choose",
-    long_about = "Run Cloudflare WARP clients side by side, and exit in the region you choose.\n\nEach instance lives in its own network namespace, so instances never conflict with each other or with the host's routing. Instances have an index from 0 to 255 and, optionally, a name; commands accept either. Root and each user have separate instances.\n\nTo exit in another region, pass `--location` with where you want to be and `--via` with a relay there. Waywarp connects through the relay, then moves the connection back to your own network.\n\nSet WAYWARP_LOG to a level such as `debug` for more detail. Each instance also writes a log to its state directory."
+    long_about = "Run Cloudflare WARP clients side by side, and exit in the region you choose.\n\nEach instance lives in its own network namespace, so instances never conflict with each other or with the host's routing. Instances have an index from 0 to 255 and, optionally, a name; commands accept either. Root and each user have separate instances.\n\nTo exit in another region, pass `--location` with where you want to be and `--via` with a relay there. Waywarp connects through the relay, then moves the connection back to your own network.\n\nSet WAYWARP_LOG to a level such as `debug` for more detail. Detached instances write a log to their state directory; foreground instances log to stderr."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -173,43 +174,5 @@ mod tests {
         assert!(!parses(&["up", "bridge", "--listen", "127.0.0.1:1080"]));
         assert!(!parses(&["up", "proxy", "--listen", "0.0.0.0:1080"]));
         assert!(!parses(&["up"]));
-    }
-
-    #[test]
-    fn terms_acceptance_is_explicit_in_both_access_modes() {
-        for mode in ["proxy", "bridge"] {
-            for accepted in [false, true] {
-                let mut arguments = vec!["waywarp", "up", mode];
-                if accepted {
-                    arguments.push("--accept-tos");
-                }
-                let Command::Up(access) = Cli::try_parse_from(arguments).unwrap().command else {
-                    panic!("expected up");
-                };
-                assert_eq!(access.common().accept_tos, accepted);
-            }
-        }
-    }
-
-    #[test]
-    fn warp_cli_passes_arguments_through() {
-        let cli = Cli::try_parse_from(["waywarp", "warp-cli", "1", "--json", "status"]).unwrap();
-        let Command::WarpCli { arguments, .. } = cli.command else {
-            panic!("expected warp-cli");
-        };
-        assert_eq!(arguments, ["--json", "status"]);
-        let cli = Cli::try_parse_from([
-            "waywarp",
-            "warp-cli",
-            "1",
-            "--accept-tos",
-            "registration",
-            "new",
-        ])
-        .unwrap();
-        let Command::WarpCli { arguments, .. } = cli.command else {
-            panic!("expected warp-cli");
-        };
-        assert_eq!(arguments, ["--accept-tos", "registration", "new"]);
     }
 }

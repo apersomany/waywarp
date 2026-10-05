@@ -23,9 +23,11 @@ Stopping an instance keeps its registration and name. Starting it again reuses t
 
 ## Status and control
 
-`waywarp status` lists running instances. Pass an index or name to check just one. `status --json` prints one JSON object per instance, rather than a JSON array.
+`waywarp status` lists running instances. Pass an index or name to check just one. Human output is a compact, aligned table: `Instance` contains `INDEX (NAME)`, or just `INDEX` when unnamed, and `Access` contains `ADDRESS (proxy)` or `LINK (bridge)`. Both the `Instance` key and value are colored on suitable terminals. See [terminal output](terminal-output.md) for examples, color controls, and stream contracts.
 
-The command exits `1` if any reported instance is disconnected or fails its location requirements. This is useful as a connection health check, but it does not test reachability to every destination. Bridge NAT targets and configuration validity are reported separately.
+`status --json` prints one JSON object per instance, rather than a JSON array. Status results go to stdout; diagnostics go to stderr.
+
+The command exits `1` unless every reported instance has a currently verified connection and meets its location requirements. A connected tunnel awaiting fresh verification is reported as degraded; its location fields retain the last verified observations. This is useful as a connection health check, but it does not test reachability to every destination. Bridge NAT targets and configuration validity are reported separately.
 
 `waywarp warp-cli INSTANCE ...` runs `warp-cli` against that instance's daemon with your arguments unchanged. If a command requires terms acceptance, pass it explicitly, for example `waywarp warp-cli INSTANCE --accept-tos registration new`. Waywarp does not add the flag to these calls. `down` stops the instance without deleting its registration or name.
 
@@ -37,7 +39,7 @@ Use foreground mode when a service manager should own the process:
 waywarp up proxy 1 --name home --foreground
 ```
 
-It logs to stderr, stops on SIGTERM, and signals systemd readiness through `NOTIFY_SOCKET`. Ready means WARP is connected and the requested locations match. A runtime failure stops the instance; Waywarp does not restart itself. Let the service manager handle that, or use the [NixOS module](nixos.md).
+It prints one readiness table to stdout, logs lifecycle messages and diagnostics to stderr, stops on SIGTERM, and signals systemd readiness through `NOTIFY_SOCKET`. Ready means WARP is connected and the requested locations match. A runtime failure stops the instance; Waywarp does not restart itself. Let the service manager handle that, or use the [NixOS module](nixos.md).
 
 ## Networks
 
@@ -56,18 +58,23 @@ Waywarp bypasses host VPNs rather than using them as relays. If the host route p
 
 ## Logs
 
-Detached runs write a fresh log for each start:
+Detached runs replace the previous log on each start. The log is owner-only and includes timestamps, levels, thread names, and targets; lifecycle records retain structured instance context:
 
 | Owner | Log |
 | --- | --- |
 | Normal user | `$XDG_STATE_HOME/waywarp/INDEX/waywarp.log`, or `~/.local/state/waywarp/INDEX/waywarp.log` by default |
 | Root | `/var/lib/waywarp/INDEX/waywarp.log` |
 
-Foreground runs log to stderr, which goes to the journal under systemd. Set `WAYWARP_LOG` to change the level for the command and its supervisor. Per-module overrides are also supported:
+Foreground runs log to stderr, which goes to the journal under systemd. Console lifecycle messages omit instance identity, for example `info: connecting directly`. Commands default to info for the `waywarp::lifecycle` target and warn for other diagnostics; supervisors default to info. These defaults also apply when stderr is redirected.
+
+Set `WAYWARP_LOG` to override filtering for the command and its supervisor, including lifecycle notices. It does not suppress status or JSON results. Per-target overrides are also supported:
 
 ```sh
 WAYWARP_LOG=debug waywarp up proxy --accept-tos
 WAYWARP_LOG=info,waywarp::dataplane=trace waywarp up proxy --accept-tos
+WAYWARP_LOG=warn,waywarp::lifecycle=info waywarp up proxy --accept-tos
 ```
+
+Successful `down` and `import` commands also report through tracing on stderr; they write no stdout result.
 
 Registrations contain credentials. Do not include their contents in a bug report.

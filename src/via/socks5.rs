@@ -1,29 +1,27 @@
 use super::Relay;
 use super::interface::Interface;
+use super::transport::Stream;
+use crate::dataplane::Observer;
 use anyhow::{Context, Result, bail};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
-use std::time::Duration;
 
 // Connects to the relay and completes SOCKS5 method negotiation and authentication.
-fn handshake(interface: &Interface, relay: &Relay) -> Result<TcpStream> {
-    let authenticate = || handshake_unpaced(interface, relay);
+fn handshake(interface: &Interface, relay: &Relay, observer: &Observer) -> Result<Stream> {
+    let authenticate = || handshake_unpaced(interface, relay, observer);
     match relay
         .login
         .as_ref()
         .and_then(|login| login.auth_limit.as_deref())
     {
-        Some(path) => super::auth_limit::run(path, authenticate),
+        Some(path) => super::auth_limit::run(path, observer, authenticate),
         None => authenticate(),
     }
 }
 
-fn handshake_unpaced(interface: &Interface, relay: &Relay) -> Result<TcpStream> {
-    let mut control = interface
-        .connect(relay.server, Duration::from_secs(5))
+fn handshake_unpaced(interface: &Interface, relay: &Relay, observer: &Observer) -> Result<Stream> {
+    let mut control = Stream::connect(interface, relay.server, observer)
         .with_context(|| format!("connecting to SOCKS5 relay {}", relay.label))?;
-    control.set_read_timeout(Some(Duration::from_secs(5)))?;
-    control.set_write_timeout(Some(Duration::from_secs(5)))?;
     let method = if relay.login.is_some() { 2 } else { 0 };
     control.write_all(&[5, 1, method])?;
     let mut reply = [0; 2];
@@ -46,7 +44,7 @@ fn handshake_unpaced(interface: &Interface, relay: &Relay) -> Result<TcpStream> 
 }
 
 // Reads a SOCKS5 reply and returns the bound address it carries.
-fn reply(control: &mut TcpStream, relay: &Relay, refused: &str) -> Result<SocketAddrV4> {
+fn reply(control: &mut Stream, relay: &Relay, refused: &str) -> Result<SocketAddrV4> {
     let mut header = [0; 4];
     control.read_exact(&mut header)?;
     if header[..3] != [5, 0, 0] {
@@ -83,19 +81,29 @@ fn reply(control: &mut TcpStream, relay: &Relay, refused: &str) -> Result<Socket
 }
 
 // Performs a SOCKS5 UDP ASSOCIATE; the association lives as long as the returned stream.
-pub fn associate(interface: &Interface, relay: &Relay) -> Result<(TcpStream, SocketAddrV4)> {
-    let mut control = handshake(interface, relay)?;
+pub fn associate(
+    interface: &Interface,
+    relay: &Relay,
+    observer: &Observer,
+) -> Result<(TcpStream, SocketAddrV4)> {
+    let mut control = handshake(interface, relay, observer)?;
     control.write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0])?;
     let address = reply(&mut control, relay, "UDP association")?;
     if address.port() == 0 {
         bail!("SOCKS5 relay returned port zero for UDP");
     }
-    Ok((control, address))
+    Ok((control.into_inner(), address))
 }
 
 // Opens a TCP stream to `host` through the relay, which resolves the name itself.
-pub fn connect(interface: &Interface, relay: &Relay, host: &str, port: u16) -> Result<TcpStream> {
-    let mut control = handshake(interface, relay)?;
+pub fn connect(
+    interface: &Interface,
+    relay: &Relay,
+    host: &str,
+    port: u16,
+    observer: &Observer,
+) -> Result<Stream> {
+    let mut control = handshake(interface, relay, observer)?;
     let mut request = vec![5, 1, 0, 3, host.len() as u8];
     request.extend_from_slice(host.as_bytes());
     request.extend_from_slice(&port.to_be_bytes());
@@ -122,6 +130,114 @@ pub fn payload(source: SocketAddrV4, frame: &[u8]) -> Option<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::via::Login;
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    fn relay(listener: &TcpListener, authenticated: bool) -> Relay {
+        let std::net::SocketAddr::V4(server) = listener.local_addr().unwrap() else {
+            unreachable!()
+        };
+        Relay {
+            label: "test".into(),
+            server,
+            login: authenticated.then(|| Login {
+                username: "u".into(),
+                password: "p".into(),
+                auth_limit: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn associations_preserve_authentication_addresses_and_control_lifetime() {
+        for authenticated in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let relay = relay(&listener, authenticated);
+            let server = thread::spawn(move || {
+                let (mut control, _) = listener.accept().unwrap();
+                control
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let method = if authenticated { 2 } else { 0 };
+                let mut greeting = [0; 3];
+                control.read_exact(&mut greeting).unwrap();
+                assert_eq!(greeting, [5, 1, method]);
+                control.write_all(&[5, method]).unwrap();
+                if authenticated {
+                    let mut credentials = [0; 5];
+                    control.read_exact(&mut credentials).unwrap();
+                    assert_eq!(credentials, [1, 1, b'u', 1, b'p']);
+                    control.write_all(&[1, 0]).unwrap();
+                }
+                let mut request = [0; 10];
+                control.read_exact(&mut request).unwrap();
+                assert_eq!(request, [5, 3, 0, 1, 0, 0, 0, 0, 0, 0]);
+                control
+                    .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 4, 210])
+                    .unwrap();
+                assert_eq!(control.read(&mut [0]).unwrap(), 0);
+            });
+            let (control, address) =
+                associate(&Interface::Named("lo".into()), &relay, &Observer::default()).unwrap();
+            assert_eq!(address, SocketAddrV4::new(*relay.server.ip(), 1234));
+            drop(control);
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn cancellation_interrupts_every_socks5_reply_stage() {
+        for stage in 0..4 {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let relay = relay(&listener, true);
+            let observer = Observer::default();
+            let cancelled = observer.clone();
+            let (finished, result) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                finished
+                    .send(associate(
+                        &Interface::Named("lo".into()),
+                        &relay,
+                        &cancelled,
+                    ))
+                    .unwrap();
+            });
+            let (mut control, _) = listener.accept().unwrap();
+            control
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut greeting = [0; 3];
+            control.read_exact(&mut greeting).unwrap();
+            assert_eq!(greeting, [5, 1, 2]);
+            if stage > 0 {
+                control.write_all(&[5, 2]).unwrap();
+                let mut credentials = [0; 5];
+                control.read_exact(&mut credentials).unwrap();
+                assert_eq!(credentials, [1, 1, b'u', 1, b'p']);
+            }
+            if stage > 1 {
+                control.write_all(&[1, 0]).unwrap();
+                let mut request = [0; 10];
+                control.read_exact(&mut request).unwrap();
+                assert_eq!(request, [5, 3, 0, 1, 0, 0, 0, 0, 0, 0]);
+            }
+            if stage > 2 {
+                control.write_all(&[5, 0, 0, 1]).unwrap();
+            }
+            observer.stop();
+            let completed = result.recv_timeout(Duration::from_secs(1));
+            drop(control);
+            worker.join().unwrap();
+            assert_eq!(
+                completed.unwrap().unwrap_err().root_cause().to_string(),
+                "relay operation was cancelled",
+                "reply stage {stage}"
+            );
+        }
+    }
 
     #[test]
     fn socks5_frames_round_trip_and_reject_fragments_or_other_sources() {

@@ -5,6 +5,7 @@
   cloudflare-warp ? null,
   iproute2,
   nftables,
+  doCheck ? true,
   # Helpers the supervisor runs, including after `waywarp up` exits; empty leaves them to PATH.
   runtime ? [
     cloudflare-warp
@@ -18,13 +19,17 @@ in
 rustPlatform.buildRustPackage {
   pname = manifest.name;
   inherit (manifest) version;
+  inherit doCheck;
   src = lib.fileset.toSource {
     root = ../.;
-    fileset = lib.fileset.unions [
-      ../Cargo.toml
-      ../Cargo.lock
-      ../src
-    ];
+    fileset = lib.fileset.unions (
+      [
+        ../Cargo.toml
+        ../Cargo.lock
+        ../src
+      ]
+      ++ lib.optional doCheck ../tests
+    );
   };
   cargoLock.lockFile = ../Cargo.lock;
   nativeBuildInputs = lib.optional (runtime != [ ]) makeWrapper;

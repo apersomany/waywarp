@@ -46,7 +46,9 @@ runCommand "waywarp-installer" { } ''
 
   release
   install x86_64 || { cat log; exit 1; }
-  grep -F 'Installed waywarp 0.1.0' log
+  grep -F 'note: installed waywarp 0.1.0' log
+  grep -F 'step: downloading waywarp-x86_64-linux' log
+  grep -F 'warning: not on PATH:' log
   test -x prefix/bin/waywarp
 
   release

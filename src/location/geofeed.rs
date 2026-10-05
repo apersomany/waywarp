@@ -39,25 +39,32 @@ fn fresh(path: &Path) -> bool {
         .is_some_and(|age| age < MAX_AGE)
 }
 
-fn update(path: &Path, url: &str, headers: &[(&str, &str)], limit: u64) -> Result<()> {
+fn install(path: &Path, data: &[u8], validate: impl FnOnce(&[u8]) -> Result<()>) -> Result<()> {
+    validate(data)?;
+    crate::store::atomic_write(path, data)
+}
+
+fn update(
+    path: &Path,
+    url: &str,
+    headers: &[(&str, &str)],
+    limit: u64,
+    validate: impl FnOnce(&[u8]) -> Result<()>,
+) -> Result<()> {
     debug!(url, "refreshing");
     let data = Request {
         headers,
         ..Request::new(url, limit)
     }
     .get()?;
-    // Every instance in a store shares the cache, so each writes its own temporary file.
-    let temporary = path.with_extension(format!("{}.new", std::process::id()));
-    fs::write(&temporary, data)?;
-    fs::rename(temporary, path)?;
-    Ok(())
+    install(path, &data, validate)
 }
 
-fn ensure(path: &Path, url: &str, headers: &[(&str, &str)], limit: u64) -> Result<()> {
+fn ensure(path: &Path, refresh: impl FnOnce() -> Result<()>) -> Result<()> {
     if fresh(path) {
         return Ok(());
     }
-    match update(path, url, headers, limit) {
+    match refresh() {
         Ok(()) => Ok(()),
         Err(error) if path.is_file() => {
             warn!(path = %path.display(), "using stale data: {error:#}");
@@ -72,19 +79,37 @@ impl Geofeed {
         let colos = store.cache("locations.json");
         let geofeed = store.cache("local-ip-ranges.csv");
         // The colo catalog only answers requests that appear to come from the speed test page.
-        ensure(
-            &colos,
-            COLOS_URL,
-            &[("Origin", "https://speed.cloudflare.com")],
-            128 * 1024,
-        )?;
-        ensure(&geofeed, GEOFEED_URL, &[], 8 * 1024 * 1024)?;
-        Self::parse(&fs::read(colos)?, &fs::read_to_string(geofeed)?)
+        ensure(&colos, || {
+            update(
+                &colos,
+                COLOS_URL,
+                &[("Origin", "https://speed.cloudflare.com")],
+                128 * 1024,
+                |data| Self::catalog(data).map(drop),
+            )
+        })?;
+        let colos_data = fs::read(&colos)?;
+        ensure(&geofeed, || {
+            update(&geofeed, GEOFEED_URL, &[], 8 * 1024 * 1024, |data| {
+                Self::parse(&colos_data, std::str::from_utf8(data)?).map(drop)
+            })
+        })?;
+        Self::parse(&colos_data, &fs::read_to_string(geofeed)?)
     }
 
-    fn parse(colos: &[u8], geofeed: &str) -> Result<Self> {
-        let colos: Vec<Colo> = serde_json::from_slice(colos)?;
-        let colos: HashMap<_, _> = colos
+    fn catalog(data: &[u8]) -> Result<HashMap<String, String>> {
+        let colos: Vec<Colo> = serde_json::from_slice(data)?;
+        if colos.is_empty()
+            || colos.iter().any(|colo| {
+                colo.iata.len() != 3
+                    || !colo.iata.bytes().all(|byte| byte.is_ascii_alphabetic())
+                    || colo.cca2.len() != 2
+                    || !colo.cca2.bytes().all(|byte| byte.is_ascii_alphabetic())
+            })
+        {
+            bail!("Cloudflare returned incomplete location data");
+        }
+        Ok(colos
             .into_iter()
             .map(|colo| {
                 (
@@ -92,7 +117,11 @@ impl Geofeed {
                     colo.cca2.to_ascii_uppercase(),
                 )
             })
-            .collect();
+            .collect())
+    }
+
+    fn parse(colos: &[u8], geofeed: &str) -> Result<Self> {
+        let colos = Self::catalog(colos)?;
         // Rows read `network,country,region,city,postal`.
         let mut ranges: Vec<_> = geofeed
             .lines()
@@ -118,7 +147,7 @@ impl Geofeed {
                 .iter()
                 .any(|(network, _)| network.addr().is_ipv6() == ipv6)
         };
-        if colos.is_empty() || !family(false) || !family(true) {
+        if !family(false) || !family(true) {
             bail!("Cloudflare returned incomplete location data");
         }
         Ok(Self { colos, ranges })
@@ -158,6 +187,46 @@ impl Geofeed {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_refresh_validates_before_installing_and_keeps_stale_data() {
+        let directory = crate::test_support::TempDirectory::new("geofeed");
+        let colos = br#"[{"iata":"NRT","cca2":"JP"}]"#;
+        let path = directory.path.join("locations.json");
+        fs::write(&path, colos).unwrap();
+        for invalid in [
+            b"malformed".as_slice(),
+            b"[]",
+            br#"[{"iata":"","cca2":"JP"}]"#,
+        ] {
+            assert!(install(&path, invalid, |data| Geofeed::catalog(data).map(drop)).is_err());
+            assert_eq!(fs::read(&path).unwrap(), colos);
+        }
+        ensure(&path, || panic!("fresh data must not be downloaded")).unwrap();
+        let feed = directory.path.join("feed.csv");
+        fs::write(&feed, b"previous valid feed").unwrap();
+        let times =
+            fs::FileTimes::new().set_modified(SystemTime::now() - MAX_AGE - Duration::from_secs(1));
+        fs::File::options()
+            .write(true)
+            .open(&feed)
+            .unwrap()
+            .set_times(times)
+            .unwrap();
+        let validate = |data: &[u8]| Geofeed::parse(colos, std::str::from_utf8(data)?).map(drop);
+        for invalid in [b"malformed".as_slice(), b"104.28.0.0/16,JP,,,\n", b"\xff"] {
+            ensure(&feed, || install(&feed, invalid, validate)).unwrap();
+            assert_eq!(fs::read(&feed).unwrap(), b"previous valid feed");
+            assert!(!fresh(&feed));
+        }
+        let valid = b"104.28.0.0/16,JP,,,\n2a09:bac1::/32,JP,,Tokyo,\n";
+        ensure(&feed, || install(&feed, valid, validate)).unwrap();
+        assert_eq!(fs::read(&feed).unwrap(), valid);
+        assert!(fresh(&feed));
+        let missing = directory.path.join("missing.csv");
+        assert!(ensure(&missing, || install(&missing, b"malformed", validate)).is_err());
+        assert!(!missing.exists());
+    }
 
     #[test]
     fn the_most_specific_range_wins() {

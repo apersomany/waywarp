@@ -219,24 +219,6 @@ impl Locations {
     }
 }
 
-impl fmt::Display for Locations {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "geo4 {}, geo6 {}, edge {}, probe4 {}, probe6 {}",
-            unavailable(&self.geo4),
-            unavailable(&self.geo6),
-            if self.edge.is_empty() {
-                "unavailable"
-            } else {
-                &self.edge
-            },
-            unavailable(&self.probe4),
-            unavailable(&self.probe6)
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,4 +1,5 @@
 // The warp-svc process of one instance.
+use crate::dataplane::Observer;
 use crate::sandbox::Private;
 use crate::tool;
 use anyhow::{Context, Result, bail};
@@ -84,7 +85,11 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    pub fn start(private: &Private, on_exit: impl FnOnce(String) + Send + 'static) -> Result<Self> {
+    pub fn start(
+        private: &Private,
+        observer: &Observer,
+        on_exit: impl FnOnce(String) + Send + 'static,
+    ) -> Result<Self> {
         let (sender, receiver) = mpsc::channel();
         let exited = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&exited);
@@ -112,6 +117,9 @@ impl Daemon {
             owner: Some(owner),
         };
         let started = wait_ready(|| {
+            if observer.stopped() {
+                bail!("daemon startup was cancelled");
+            }
             if daemon.exited.load(Ordering::SeqCst) {
                 bail!("warp-svc exited during startup");
             }
@@ -135,14 +143,19 @@ pub fn registered() -> bool {
 }
 
 // Registration needs TCP, which the private namespace cannot reach, so it runs on the host network.
-pub fn register(accept_tos: bool) -> Result<()> {
+pub fn register(accept_tos: bool, observer: &Observer) -> Result<()> {
     super::require_consent(accept_tos)?;
     let mut daemon = spawn(true)?;
-    let result = wait_ready(|| match daemon.try_wait()? {
-        Some(status) => bail!("warp-svc exited during registration ({status})"),
-        None => Ok(()),
+    let result = wait_ready(|| {
+        if observer.stopped() {
+            bail!("registration was cancelled");
+        }
+        match daemon.try_wait()? {
+            Some(status) => bail!("warp-svc exited during registration ({status})"),
+            None => Ok(()),
+        }
     })
-    .and_then(|()| super::cli(&["registration", "new"]));
+    .and_then(|()| super::cli(&["registration", "new"], observer));
     terminate(group(&daemon), || !matches!(daemon.try_wait(), Ok(None)));
     let _ = daemon.wait();
     result.context("registering a WARP device").map(drop)
@@ -154,7 +167,9 @@ mod tests {
 
     #[test]
     fn registration_requires_consent_before_starting_a_daemon() {
-        let error = register(false).unwrap_err().to_string();
+        let error = register(false, &Observer::default())
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("--accept-tos"));
         assert!(error.contains("https://www.cloudflare.com/application/terms/"));
         assert!(crate::warp::require_consent(true).is_ok());

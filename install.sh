@@ -7,8 +7,14 @@ repository=apersomany/waywarp
 prefix=${WAYWARP_PREFIX:-/usr/local}
 version=${WAYWARP_VERSION:-latest}
 
+report() {
+    level=$1
+    shift
+    printf '%s: %s\n' "$level" "$*" >&2
+}
+
 fail() {
-    echo "waywarp install: $*" >&2
+    report error "waywarp install: $*"
     exit 1
 }
 
@@ -37,7 +43,7 @@ directory=$(mktemp -d)
 trap 'rm -rf "$directory"' EXIT INT TERM
 cd "$directory"
 
-echo "Downloading waywarp-$system ($version)"
+report step "downloading waywarp-$system ($version)"
 download "$base/waywarp-$system" "waywarp-$system" || fail "cannot download waywarp-$system"
 download "$base/SHA256SUMS" SHA256SUMS || fail "cannot download SHA256SUMS"
 grep " waywarp-$system\$" SHA256SUMS | sha256sum -c - >/dev/null || fail "checksum mismatch"
@@ -46,7 +52,7 @@ grep " waywarp-$system\$" SHA256SUMS | sha256sum -c - >/dev/null || fail "checks
 if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
     gh attestation verify "waywarp-$system" --repo "$repository" >/dev/null ||
         fail "provenance verification failed"
-    echo "Verified build provenance"
+    report note "verified build provenance"
 fi
 
 # Writing to the default prefix usually needs root.
@@ -57,9 +63,15 @@ if ! mkdir -p "$prefix/bin" 2>/dev/null || ! [ -w "$prefix/bin" ]; then
     run=sudo
 fi
 $run install -D -m 755 "waywarp-$system" "$target"
-echo "Installed $("$target" --version) to $target"
+printf 'note: installed %s to %s\n' "$("$target" --version)" "$target"
 
+missing=
 for tool in warp-svc warp-cli ip nft; do
-    command -v "$tool" >/dev/null 2>&1 ||
-        echo "Note: $tool is not on PATH; Waywarp needs Cloudflare WARP, iproute2, and nftables" >&2
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        missing="${missing:+$missing, }$tool"
+    fi
 done
+if [ -n "$missing" ]; then
+    report warning "not on PATH: $missing"
+    report note "Waywarp needs Cloudflare WARP, iproute2, and nftables"
+fi

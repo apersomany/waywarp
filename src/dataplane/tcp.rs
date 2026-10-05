@@ -76,7 +76,7 @@ struct Splice {
 
 impl Splice {
     // Edge-triggered readiness: every event drains both directions until they would block.
-    fn advance(&mut self) -> std::io::Result<bool> {
+    fn advance(&mut self, cancelled: impl Fn() -> bool) -> std::io::Result<bool> {
         if !self.connected {
             if let Some(error) = self.sockets[1].take_error()? {
                 return Err(error);
@@ -87,7 +87,7 @@ impl Splice {
                 Err(error) => return Err(error),
             }
         }
-        loop {
+        while !cancelled() {
             let mut progressed = false;
             for direction in 0..2 {
                 let [first, second] = &mut self.sockets;
@@ -156,12 +156,12 @@ impl Splices {
         Ok(())
     }
 
-    pub fn ready(&mut self, registry: &Registry, token: Token) {
+    pub fn ready(&mut self, registry: &Registry, token: Token, cancelled: impl Fn() -> bool) {
         let key = (token.0 - self.base) / 2;
         let Some(splice) = self.sessions.get_mut(key) else {
             return;
         };
-        let finished = match splice.advance() {
+        let finished = match splice.advance(cancelled) {
             Ok(finished) => finished,
             Err(error) => {
                 if !matches!(
@@ -196,6 +196,83 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn cancellation_interrupts_a_progressing_splice_between_transfer_rounds() {
+        let ingress = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = std::net::TcpStream::connect(ingress.local_addr().unwrap()).unwrap();
+        let (incoming, _) = ingress.accept().unwrap();
+        incoming.set_nonblocking(true).unwrap();
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        let outgoing = std::net::TcpStream::connect(target.local_addr().unwrap()).unwrap();
+        let (mut server, _) = target.accept().unwrap();
+        outgoing.set_nonblocking(true).unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let payload = b"buffered before cancellation";
+        let mut bytes = vec![0; BUFFER].into_boxed_slice();
+        bytes[..payload.len()].copy_from_slice(payload);
+        let mut splice = Splice {
+            sockets: [TcpStream::from_std(incoming), TcpStream::from_std(outgoing)],
+            pipes: [
+                Pipe {
+                    bytes: Some(bytes),
+                    end: payload.len(),
+                    ..Pipe::default()
+                },
+                Pipe::default(),
+            ],
+            connected: true,
+        };
+        let checks = std::cell::Cell::new(0);
+        assert!(
+            !splice
+                .advance(|| {
+                    checks.set(checks.get() + 1);
+                    checks.get() > 1
+                })
+                .unwrap()
+        );
+        assert_eq!(checks.get(), 2);
+        let mut received = vec![0; payload.len()];
+        server.read_exact(&mut received).unwrap();
+        assert_eq!(received, payload);
+        assert!(
+            !splice.pipes[0].closed,
+            "cancellation must not close the source"
+        );
+    }
+
+    #[test]
+    fn refused_connect_does_not_leave_a_splice_registered() {
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = target.local_addr().unwrap();
+        drop(target);
+        let ingress = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = std::net::TcpStream::connect(ingress.local_addr().unwrap()).unwrap();
+        let (incoming, _) = ingress.accept().unwrap();
+        incoming.set_nonblocking(true).unwrap();
+        let mut poll = Poll::new().unwrap();
+        let mut splices = Splices::new(16);
+        splices
+            .insert(
+                poll.registry(),
+                TcpStream::from_std(incoming),
+                TcpStream::from_std(crate::via::interface::connect_tcp(address).unwrap()),
+            )
+            .unwrap();
+        let mut events = Events::with_capacity(16);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !splices.is_empty() && Instant::now() < deadline {
+            poll.poll(&mut events, Some(Duration::from_millis(50)))
+                .unwrap();
+            for event in &events {
+                splices.ready(poll.registry(), event.token(), || false);
+            }
+        }
+        assert!(splices.is_empty());
+    }
+
+    #[test]
     fn splice_forwards_both_directions_and_half_closes() {
         let target = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = target.local_addr().unwrap();
@@ -219,7 +296,7 @@ mod tests {
             .insert(
                 poll.registry(),
                 incoming,
-                TcpStream::connect(address).unwrap(),
+                TcpStream::from_std(crate::via::interface::connect_tcp(address).unwrap()),
             )
             .unwrap();
         let worker = thread::spawn(move || {
@@ -229,7 +306,7 @@ mod tests {
                 poll.poll(&mut events, Some(Duration::from_millis(50)))
                     .unwrap();
                 for event in &events {
-                    splices.ready(poll.registry(), event.token());
+                    splices.ready(poll.registry(), event.token(), || false);
                 }
             }
             assert!(splices.is_empty(), "splice did not finish");

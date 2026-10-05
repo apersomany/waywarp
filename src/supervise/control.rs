@@ -1,33 +1,46 @@
 // Serves `status`, `warp-cli`, and `down` on the instance's control socket.
-use super::{Stop, Supervisor};
+use super::{Stop, Stopper, Supervisor};
 use crate::ipc::{self, Channel, Listener};
-use crate::protocol::{Request, Response};
+use crate::protocol::{Failure, Request, Response};
 use crate::tool;
 use anyhow::{Context, Result};
 use std::os::fd::OwnedFd;
 use std::process::Stdio;
-use std::sync::{Arc, mpsc};
-use std::thread;
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
-use tracing::{debug, warn};
+use tracing::warn;
 
 // Each client gets its own thread, so a slow warp-cli never delays `status`.
 pub(super) fn serve(
     listener: Listener,
     supervisor: &Arc<Supervisor>,
-    stop: &mpsc::Sender<Stop>,
-) -> Result<()> {
+    stop: &Stopper,
+) -> Result<JoinHandle<()>> {
+    listener.set_nonblocking()?;
     let (supervisor, stop) = (Arc::clone(supervisor), stop.clone());
-    thread::Builder::new()
+    Ok(thread::Builder::new()
         .name("control".into())
         .spawn(move || {
-            loop {
+            while !stop.observer.stopped() {
                 let client = match listener.accept() {
                     Ok(client) => client,
-                    Err(error) => {
-                        warn!("control accept failed: {error:#}");
-                        thread::sleep(Duration::from_millis(100));
+                    Err(error)
+                        if error.downcast_ref::<nix::errno::Errno>()
+                            == Some(&nix::errno::Errno::EAGAIN) =>
+                    {
+                        thread::sleep(Duration::from_millis(50));
                         continue;
+                    }
+                    Err(error)
+                        if error.downcast_ref::<nix::errno::Errno>()
+                            == Some(&nix::errno::Errno::EINTR) =>
+                    {
+                        continue;
+                    }
+                    Err(error) => {
+                        stop.request(Stop::Failed(error.context("accepting a control client")));
+                        return;
                     }
                 };
                 let (supervisor, stop) = (Arc::clone(&supervisor), stop.clone());
@@ -36,22 +49,20 @@ pub(super) fn serve(
                         .name("control-client".into())
                         .spawn(move || {
                             if let Err(error) = handle(&client, &supervisor, &stop) {
-                                let _ = client.send(&Response::Failed(format!("{error:#}")), &[]);
+                                let _ = client.send(&Response::Failed(Failure::from(&error)), &[]);
                             }
                         });
                 if let Err(error) = spawned {
                     warn!(%error, "cannot serve a control client");
                 }
             }
-        })?;
-    Ok(())
+        })?)
 }
 
-fn handle(client: &Channel, supervisor: &Supervisor, stop: &mpsc::Sender<Stop>) -> Result<()> {
+fn handle(client: &Channel, supervisor: &Supervisor, stop: &Stopper) -> Result<()> {
     client.set_timeout(Some(Duration::from_secs(10)))?;
     let (request, descriptors): (Request, Vec<OwnedFd>) = client.expect()?;
     client.set_timeout(None)?;
-    debug!(?request, "control request");
     match request {
         Request::Status => client.send(&Response::Status(Box::new(supervisor.status())), &[]),
         Request::WarpCli(arguments) => {
@@ -71,11 +82,8 @@ fn handle(client: &Channel, supervisor: &Supervisor, stop: &mpsc::Sender<Stop>) 
             client.send(&Response::Exit(code), &[])
         }
         Request::Stop => {
-            let _ = stop.send(Stop::Requested);
-            // The client sees EOF when the process exits, which happens only after shutdown.
-            loop {
-                thread::park();
-            }
+            stop.request(Stop::Requested(Some(client.try_clone()?)));
+            Ok(())
         }
     }
 }

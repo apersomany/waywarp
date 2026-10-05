@@ -5,6 +5,7 @@ mod monitor;
 pub use daemon::{Daemon, register, registered};
 pub use monitor::{Monitor, State};
 
+use crate::dataplane::Observer;
 use crate::tool;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -23,18 +24,18 @@ pub fn proxy_address() -> SocketAddr {
 pub fn require_consent(accepted: bool) -> Result<()> {
     if !accepted {
         bail!(
-            "a new WARP registration requires accepting Cloudflare's Terms of Service: https://www.cloudflare.com/application/terms/; review them and pass --accept-tos to agree, or import an existing registration"
+            "a new WARP registration requires accepting Cloudflare's Terms of Service.\n\nReview: https://www.cloudflare.com/application/terms/\nThen pass --accept-tos to agree, or import an existing registration."
         );
     }
     Ok(())
 }
 
 // Internal commands run only after explicit acceptance or reuse of an existing registration.
-pub fn cli(arguments: &[&str]) -> Result<String> {
+fn cli(arguments: &[&str], observer: &Observer) -> Result<String> {
     let arguments: Vec<_> = std::iter::once("--accept-tos")
         .chain(arguments.iter().copied())
         .collect();
-    tool::run("warp-cli", &arguments)
+    tool::run_cancellable("warp-cli", &arguments, || observer.stopped())
 }
 
 #[derive(Deserialize)]
@@ -49,15 +50,15 @@ struct Effective {
 }
 
 // Changes only what differs, since an organization's policy can lock settings it already fixes.
-pub fn configure(edge: SocketAddrV4, proxy: bool) -> Result<()> {
-    let current: Settings = serde_json::from_str(&cli(&["--json", "settings"])?)?;
+pub fn configure(edge: SocketAddrV4, proxy: bool, observer: &Observer) -> Result<()> {
+    let current: Settings = serde_json::from_str(&cli(&["--json", "settings"], observer)?)?;
     let current = current.settings;
     if !current.warp_tunnel_protocol.eq_ignore_ascii_case("masque") {
-        cli(&["tunnel", "protocol", "set", "MASQUE"])?;
+        cli(&["tunnel", "protocol", "set", "MASQUE"], observer)?;
     }
-    cli(&["tunnel", "endpoint", "set", &edge.to_string()])?;
+    cli(&["tunnel", "endpoint", "set", &edge.to_string()], observer)?;
     if proxy {
-        cli(&["proxy", "port", &PROXY_PORT.to_string()])?;
+        cli(&["proxy", "port", &PROXY_PORT.to_string()], observer)?;
     }
     let (mode, suitable) = if proxy {
         ("proxy", current.operation_mode == "proxy")
@@ -68,7 +69,7 @@ pub fn configure(edge: SocketAddrV4, proxy: bool) -> Result<()> {
         )
     };
     if !suitable {
-        cli(&["mode", mode]).with_context(|| {
+        cli(&["mode", mode], observer).with_context(|| {
             format!(
                 "switching WARP from {} to {mode} mode",
                 current.operation_mode
@@ -90,8 +91,8 @@ struct Edge {
     colo: String,
 }
 
-pub fn tunnel(proxy: bool) -> Result<String> {
-    let tunnel: Tunnel = serde_json::from_str(&cli(&["--json", "tunnel", "stats"])?)?;
+pub fn tunnel(proxy: bool, observer: &Observer) -> Result<String> {
+    let tunnel: Tunnel = serde_json::from_str(&cli(&["--json", "tunnel", "stats"], observer)?)?;
     if !tunnel.warp_is_on || !tunnel.protocol.starts_with("MASQUE") {
         bail!("tunnel protocol is {}, not MASQUE", tunnel.protocol);
     }
@@ -108,10 +109,10 @@ pub fn tunnel(proxy: bool) -> Result<String> {
 
 // Disconnects and waits for the daemon to confirm, so a previous session cannot migrate onto the
 // next attempt. A daemon that already gave up emits nothing on disconnect, so it counts as idle.
-pub fn disconnect(monitor: &Monitor) -> Result<()> {
+pub fn disconnect(monitor: &Monitor, observer: &Observer) -> Result<()> {
     let idle = |state: &State| matches!(state, State::Disconnected | State::Unable);
     let since = monitor.sequence();
-    cli(&["disconnect"])?;
+    cli(&["disconnect"], observer)?;
     if idle(&monitor.state()) || monitor.wait(since, Duration::from_secs(10), idle).is_some() {
         return Ok(());
     }
@@ -122,9 +123,14 @@ pub fn disconnect(monitor: &Monitor) -> Result<()> {
 }
 
 // Connects and waits for a healthy tunnel, then reads its colo.
-pub fn connect(monitor: &Monitor, proxy: bool, timeout: Duration) -> Result<String> {
+pub fn connect(
+    monitor: &Monitor,
+    proxy: bool,
+    timeout: Duration,
+    observer: &Observer,
+) -> Result<String> {
     let since = monitor.sequence();
-    cli(&["connect"])?;
+    cli(&["connect"], observer)?;
     if monitor
         .wait(since, timeout, |state| *state == State::Connected)
         .is_none()
@@ -138,7 +144,10 @@ pub fn connect(monitor: &Monitor, proxy: bool, timeout: Duration) -> Result<Stri
     // The proxy port can open slightly after WARP reports the tunnel.
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        match tunnel(proxy) {
+        if observer.stopped() {
+            bail!("WARP connection was cancelled");
+        }
+        match tunnel(proxy, observer) {
             Ok(colo) => return Ok(colo),
             Err(error) if Instant::now() >= deadline => return Err(error),
             Err(_) => thread::sleep(Duration::from_millis(100)),

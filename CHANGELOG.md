@@ -4,6 +4,16 @@ Changes are listed here using [Keep a Changelog](https://keepachangelog.com/en/1
 
 ## Unreleased
 
+## 0.1.3
+
+### Changed
+
+- Bridge namespace routing tables are selected from unused IDs, and rule priorities are derived from the kernel's local and main rules instead of fixed WARP priorities.
+
+### Fixed
+
+- Bridge replies to destinations covered by WARP-managed routes return to the host instead of reentering WARP, including IPv6 Mesh clients ([#1](https://github.com/apersomany/waywarp/issues/1)). Local connector services and locally originated WARP control traffic retain their routing behavior across reconnects.
+
 ## 0.1.2
 
 ### Changed

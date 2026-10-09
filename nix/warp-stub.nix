@@ -9,6 +9,15 @@
 # Stands in for Cloudflare WARP in VM tests: warp-cli records the requested state in the
 # instance's daemon directory, and warp-svc serves its socket and a proxy port that answers "stub".
 let
+  policy = ''
+    # Include reply destinations that expose conflicts with Waywarp's return policy.
+    for family in -4 -6; do
+      ip "$family" rule del pref 99 not fwmark 0x100cf lookup 65743 2>/dev/null || true
+      ip "$family" rule add pref 99 not fwmark 0x100cf lookup 65743
+    done
+    ip -4 route replace 100.96.0.0/12 dev CloudflareWARP table 65743
+    ip -6 route replace 2606:4700:cf1:1000::/64 dev CloudflareWARP table 65743
+  '';
   warp-svc = writeShellApplication {
     name = "warp-svc";
     runtimeInputs = [
@@ -21,7 +30,10 @@ let
       trap 'kill 0' EXIT
       # Bridge access routes into the link warp-svc creates in warp mode, whose MTU is smaller
       # than the host link's.
-      ip link add CloudflareWARP mtu 1280 type dummy 2>/dev/null && ip link set CloudflareWARP up || true
+      if ip link add CloudflareWARP mtu 1280 type dummy 2>/dev/null; then
+        ip link set CloudflareWARP up
+        ${policy}
+      fi
       echo Disconnected > /run/cloudflare-warp/state
       socat TCP-LISTEN:40000,bind=127.0.0.1,fork,reuseaddr SYSTEM:'echo stub' &
       socat UNIX-LISTEN:/run/cloudflare-warp/warp_service,fork,unlink-early EXEC:true &
@@ -75,6 +87,7 @@ let
           ip -6 address add "$v6/128" dev CloudflareWARP nodad
           # A shared connector address must never be used as the SNAT target.
           ip -6 address add 2001:db8::1/128 dev CloudflareWARP preferred_lft 0 nodad
+          ${policy}
           echo Connected > "$state"
           ;;
         *) ;;

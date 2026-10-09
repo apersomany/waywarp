@@ -1,6 +1,9 @@
 // Bridge access: a dual-stack veth pair between the host and the private WARP namespace.
 pub mod nat;
+mod routing;
 pub mod watch;
+
+pub use routing::Routing;
 
 use crate::tool;
 use crate::warp::LINK;
@@ -12,10 +15,8 @@ use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
-// The namespace end of the veth pair and policy tables for bridged traffic.
+// The namespace end of the veth pair.
 const VETH: &str = "veth";
-const WARP_TABLE: u32 = 79;
-const HOST_TABLE: u32 = 80;
 // On the host, sockets bound to a bridge link look up a per-index table whose default route leads
 // into WARP. Only locally originated traffic matches `oif`, so forwarding is unaffected.
 const LINK_TABLE: u32 = 0x7761_7700;
@@ -237,8 +238,8 @@ fn link_table(index: u8) -> u32 {
 // until the assigned addresses and routed subnets are verified after bootstrap.
 // WARP's link has a smaller MTU than the host's networks, and warp-svc's routes send too-big
 // replies away from the host, so TCP handshakes are clamped to the route MTU both ways.
-pub fn firewall(subnets: Subnets) -> Result<()> {
-    let (v4, v6) = (subnets.v4(), subnets.v6());
+pub fn firewall(subnets: Subnets) -> Result<Routing> {
+    let routing = Routing::allocate()?;
     tool::nft(&format!(
         "table inet waywarp {{
             chain prerouting {{
@@ -260,47 +261,10 @@ pub fn firewall(subnets: Subnets) -> Result<()> {
         }}"
     ))
     .context("loading the bridge firewall")?;
-    for (family, gateway) in [
-        ("-4", format!("{}/30", v4.gateway)),
-        ("-6", format!("{}/126", v6.gateway)),
-    ] {
-        tool::ip(
-            family,
-            &format!(
-                "address add {gateway} dev {VETH}
-                route add unreachable default table {WARP_TABLE} metric 4096
-                rule add pref 100 iif {VETH} lookup {WARP_TABLE}"
-            ),
-        )?;
-    }
-    tool::ip("-4", &format!("link set {VETH} up"))?;
-    // WARP ingress returns to the host. Neither the route nor the rule refers to WARP's link by
-    // index, so both outlive the link that warp-svc recreates when it reconnects.
-    for (family, host) in [("-4", v4.host.to_string()), ("-6", v6.host.to_string())] {
-        tool::ip(
-            family,
-            &format!(
-                "route add default via {host} dev {VETH} table {HOST_TABLE}
-                rule add pref 101 iif {LINK} lookup {HOST_TABLE}"
-            ),
-        )?;
-    }
+    routing.install(subnets)?;
     fs::write("/proc/sys/net/ipv4/ip_forward", "1")?;
     fs::write("/proc/sys/net/ipv6/conf/all/forwarding", "1")?;
-    Ok(())
-}
-
-// Runs inside the namespace whenever WARP is up at the required locations, sending host traffic
-// into WARP. warp-svc recreates its link when it reconnects, and the kernel drops routes through
-// the old one, so this repeats after every reconnect; `replace` makes repeating it harmless.
-fn route() -> Result<()> {
-    for family in ["-4", "-6"] {
-        tool::ip(
-            family,
-            &format!("route replace default dev {LINK} table {WARP_TABLE}"),
-        )?;
-    }
-    Ok(())
+    Ok(routing)
 }
 
 // One snapshot supplies both MTU and assigned-address verification during reconciliation.
@@ -339,8 +303,8 @@ impl WarpLink {
             }))
     }
 
-    pub fn reconcile(&self) -> Result<()> {
-        route()?;
+    pub fn reconcile(&self, routing: &Routing) -> Result<()> {
+        routing.reconcile()?;
         set_mtu(VETH, self.mtu)
     }
 }

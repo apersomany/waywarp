@@ -45,9 +45,71 @@ def physical_ipv4() -> str:
     return json.loads(machine.succeed("ip -j -4 route get 198.51.100.7"))[0]["prefsrc"]
 
 
+def bridge_table(family: str, ingress: str) -> int:
+    rules = json.loads(machine.succeed(TOKYO_NAMESPACE + f"ip -j -N {family} rule show"))
+    matches = [rule for rule in rules if rule.get("iif") == ingress]
+    assert len(matches) == 1, rules
+    return int(matches[0]["table"])
+
+
+def assert_warp_route(family: str, timeout: int = 30) -> None:
+    table = bridge_table(family, "veth")
+    machine.wait_until_succeeds(
+        TOKYO_NAMESPACE
+        + f"ip {family} route show table {table} | grep -F 'default dev CloudflareWARP'",
+        timeout=timeout,
+    )
+
+
+def warp_managed_routes() -> None:
+    for family, subnet in [
+        ("-4", "100.96.0.0/12"),
+        ("-6", "2606:4700:cf1:1000::/64"),
+    ]:
+        machine.succeed(
+            TOKYO_NAMESPACE
+            + f"ip {family} route replace {subnet} dev CloudflareWARP table 65743"
+        )
+
+
+def assert_bridge_return_routes() -> None:
+    for family, destination, source in [
+        ("-4", "100.96.0.42", "203.0.113.1"),
+        ("-6", "2606:4700:cf1:1000::42", "2001:db8:1::443"),
+    ]:
+        table = bridge_table(family, "CloudflareWARP")
+        rules = json.loads(machine.succeed(TOKYO_NAMESPACE + f"ip -j -N {family} rule show"))
+        local = next(rule for rule in rules if int(rule.get("table", 0)) == 255)
+        returning = next(rule for rule in rules if rule.get("iif") == "CloudflareWARP")
+        managed = next(rule for rule in rules if int(rule.get("table", 0)) == 65743)
+        assert local["priority"] < returning["priority"] < managed["priority"], rules
+        route = json.loads(machine.succeed(
+            TOKYO_NAMESPACE
+            + f"ip -j {family} route get {destination} from {source} iif CloudflareWARP"
+        ))[0]
+        assert route["dev"] == "veth" and int(route["table"]) == table, route
+        # Locally originated control traffic must still follow WARP's managed routes.
+        route = json.loads(machine.succeed(
+            TOKYO_NAMESPACE + f"ip -j {family} route get {destination}"
+        ))[0]
+        assert route["dev"] == "CloudflareWARP" and int(route["table"]) == 65743, route
+
+    links = json.loads(machine.succeed(TOKYO_NAMESPACE + "ip -j address show dev CloudflareWARP"))
+    for address in links[0]["addr_info"]:
+        if address["scope"] != "global":
+            continue
+        family = "-6" if address["family"] == "inet6" else "-4"
+        source = "2001:db8:1::443" if family == "-6" else "203.0.113.1"
+        route = json.loads(machine.succeed(
+            TOKYO_NAMESPACE
+            + f"ip -j {family} route get {address['local']} from {source} iif CloudflareWARP"
+        ))[0]
+        assert route["type"] == "local" and route["table"] == "local", route
+
+
 def check_services_and_proxy() -> None:
-    machine.wait_for_unit("waywarp-home.service")
-    machine.wait_for_unit("waywarp-tokyo.service")
+    machine.wait_for_unit("waywarp-home.service", timeout=60)
+    machine.wait_for_unit("waywarp-tokyo.service", timeout=60)
 
     with subtest("services do not accept terms by default or retry missing consent"):
         machine.wait_until_succeeds(
@@ -123,16 +185,16 @@ def check_services_and_proxy() -> None:
 
 
 def check_bridge_reconciliation() -> None:
+    with subtest("bridge return routing precedes WARP's managed policy for both families"):
+        assert_bridge_return_routes()
+
     with subtest("bridge links the host to the namespace"):
         machine.succeed("ip -br address show waywarp2 | grep -F 10.9.0.6/30")
         machine.wait_until_succeeds("ping -c 1 -W 2 10.9.0.5", timeout=30)
         machine.wait_until_succeeds("ping -c 1 -W 2 fd77:6179:7761:7270::9", timeout=30)
 
     with subtest("bridge routes into WARP survive reconnects"):
-        machine.succeed(
-            TOKYO_NAMESPACE
-            + "ip -4 route show table 79 | grep -F 'default dev CloudflareWARP'"
-        )
+        assert_warp_route("-4")
         machine.succeed("waywarp warp-cli tokyo disconnect")
         # Let the stub's polling status listener observe the disconnect before reconnecting.
         machine.wait_until_succeeds(
@@ -141,18 +203,13 @@ def check_bridge_reconciliation() -> None:
         machine.succeed("waywarp warp-cli tokyo connect")
         # The stub recreated the link, so only a reapplied route can be present.
         for family in ["-4", "-6"]:
-            machine.wait_until_succeeds(
-                TOKYO_NAMESPACE
-                + f"ip {family} route show table 79 | grep -F 'default dev CloudflareWARP'",
-                timeout=30,
-            )
+            assert_warp_route(family)
+        table = bridge_table("-4", "CloudflareWARP")
         machine.succeed(
             TOKYO_NAMESPACE
-            + "ip -4 route show table 80 | grep -F 'default via 10.9.0.6 dev veth'"
+            + f"ip -4 route show table {table} | grep -F 'default via 10.9.0.6 dev veth'"
         )
-        machine.succeed(
-            TOKYO_NAMESPACE + "ip -4 rule show pref 101" + " | wc -l | grep -Fx 1"
-        )
+        assert_bridge_return_routes()
 
     with subtest("kernel link changes repair the bridge without a CLI reconnect"):
         machine.succeed(TOKYO_NAMESPACE + "ip link delete CloudflareWARP")
@@ -175,12 +232,10 @@ def check_bridge_reconciliation() -> None:
             + TOKYO_NAMESPACE
             + "ip -6 address add 2001:db8::2/128 dev CloudflareWARP nodad"
         )
+        warp_managed_routes()
         for family in ["-4", "-6"]:
-            machine.wait_until_succeeds(
-                TOKYO_NAMESPACE
-                + f"ip {family} route show table 79 | grep -F 'default dev CloudflareWARP'",
-                timeout=3,
-            )
+            assert_warp_route(family, timeout=3)
+        assert_bridge_return_routes()
         machine.wait_until_succeeds(
             "ip -o link show waywarp2 | grep -F 'mtu 1360'", timeout=3
         )
@@ -191,6 +246,23 @@ def check_bridge_reconciliation() -> None:
         machine.wait_until_succeeds(
             'waywarp status tokyo --json | grep -F \'"state":"connected"\'', timeout=45
         )
+
+    with subtest("return routing does not assume WARP's priority is 99"):
+        for family in ["-4", "-6"]:
+            machine.succeed(
+                TOKYO_NAMESPACE
+                + f"ip {family} rule del pref 99 not fwmark 0x100cf lookup 65743; "
+                + TOKYO_NAMESPACE
+                + f"ip {family} rule add pref 42 not fwmark 0x100cf lookup 65743"
+            )
+        assert_bridge_return_routes()
+        for family in ["-4", "-6"]:
+            machine.succeed(
+                TOKYO_NAMESPACE
+                + f"ip {family} rule del pref 42 not fwmark 0x100cf lookup 65743; "
+                + TOKYO_NAMESPACE
+                + f"ip {family} rule add pref 99 not fwmark 0x100cf lookup 65743"
+            )
 
     with subtest("bridge sizes the link to WARP and clamps TCP"):
         machine.succeed("ip -o link show waywarp2 | grep -F 'mtu 1280'")
@@ -320,11 +392,8 @@ def check_nat_policy() -> dict[str, Any]:
             TOKYO_NAMESPACE
             + "nft list chain inet waywarp prerouting | grep -E '172.16.0.2|2001:db8::2 '"
         )
-        machine.wait_until_succeeds(
-            TOKYO_NAMESPACE
-            + "ip -4 route show table 79 | grep -F 'default dev CloudflareWARP'",
-            timeout=30,
-        )
+        assert_warp_route("-4")
+        assert_bridge_return_routes()
         assert_snat_mapping("10.9.0.6", "100.96.0.37")
         assert_snat_mapping("fd42::1", "2001:db8::37")
 
@@ -388,13 +457,10 @@ def check_connector_forwarding(policy: dict[str, Any]) -> None:
             + TOKYO_NAMESPACE
             + "ip -6 route add 2001:db8:eeee::2/128 dev CloudflareWARP"
         )
+        warp_managed_routes()
         for family in ["-4", "-6"]:
-            machine.succeed(
-                TOKYO_NAMESPACE
-                + "ip "
-                + family
-                + " route replace default dev CloudflareWARP table 79"
-            )
+            assert_warp_route(family)
+        assert_bridge_return_routes()
         for destination in ["100.96.0.37", "192.0.2.53"]:
             machine.succeed(edge + "ip route add " + destination + " dev warp-edge")
         machine.succeed(edge + "ip -6 route add 2001:db8::/64 dev warp-edge")
@@ -403,6 +469,9 @@ def check_connector_forwarding(policy: dict[str, Any]) -> None:
         physical_ip = physical_ipv4()
         listeners = [
             (edge, "TCP4-LISTEN:1053,bind=198.18.0.2,fork,reuseaddr", "tunnel"),
+            (edge, "UDP4-RECVFROM:1053,bind=198.18.0.2,fork,reuseaddr", "tunnel"),
+            (edge, "TCP6-LISTEN:1053,bind=[2001:db8:eeee::2],fork,reuseaddr", "tunnel"),
+            (edge, "UDP6-RECVFROM:1053,bind=[2001:db8:eeee::2],fork,reuseaddr", "tunnel"),
             ("", "TCP4-LISTEN:1053,bind=" + physical_ip + ",fork,reuseaddr", "uplink"),
             (
                 TOKYO_NAMESPACE,
@@ -477,6 +546,34 @@ def check_connector_forwarding(policy: dict[str, Any]) -> None:
                 + reply,
                 timeout=30,
             )
+        with subtest("reverse-SNAT replies to Mesh sources escape WARP's include routes"):
+            for family, source, destination, translated in [
+                ("4", "100.96.0.42", "198.18.0.2", "100.96.0.37"),
+                ("6", "2606:4700:cf1:1000::42", "2001:db8:eeee::2", "2001:db8::37"),
+            ]:
+                machine.succeed(
+                    f"ip -{family} address add {source}/{'128' if family == '6' else '32'} dev lo"
+                    + (" nodad" if family == "6" else "")
+                )
+                endpoint = f"[{destination}]" if family == "6" else destination
+                bind_address = f"[{source}]" if family == "6" else source
+                for protocol in ["TCP", "UDP"]:
+                    command = (
+                        f"socat -T 2 - {protocol}{family}:{endpoint}:1053,bind={bind_address}"
+                        + (",connect-timeout=2 </dev/null" if protocol == "TCP" else "")
+                        + " | grep -Fx tunnel"
+                    )
+                    if protocol == "UDP":
+                        command = "printf 'query\\n' | " + command
+                    machine.wait_until_succeeds(command, timeout=30)
+                    machine.succeed(
+                        TOKYO_NAMESPACE
+                        + f"conntrack -L -f ipv{family} -p {protocol.lower()} 2>/dev/null"
+                        + f" | grep -F 'src={source} dst={destination}'"
+                        + f" | grep -F 'src={destination} dst={translated} '"
+                    )
+                machine.succeed(f"ip -{family} address del {source}/{'128' if family == '6' else '32'} dev lo")
+
         with subtest(
             "native TCP preserves WARP routes and forwards physical-uplink traffic"
         ):

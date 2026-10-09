@@ -1,5 +1,5 @@
 use super::{Stop, Stopper, Supervisor};
-use crate::bridge::{self, Attachment, WarpLink, nat, watch::LinkEvents};
+use crate::bridge::{self, Attachment, Routing, WarpLink, nat, watch::LinkEvents};
 use crate::dataplane::Observer;
 use crate::protocol::{Access, Plan};
 use crate::sandbox::Private;
@@ -16,6 +16,7 @@ pub(super) struct Bridge {
     private: Private,
     registration: PathBuf,
     subnets: bridge::Subnets,
+    routing: Routing,
     mode: nat::Mode,
     policy: Mutex<Option<nat::Policy>>,
     links: Mutex<LinkEvents>,
@@ -31,12 +32,13 @@ impl Bridge {
             return Ok(None);
         };
         let attachment = bridge::attach(plan.instance.index, subnets, private.path())?;
-        private.run(|| bridge::firewall(subnets))?;
+        let routing = private.run(|| bridge::firewall(subnets))?;
         Ok(Some(Self {
             attachment: Mutex::new(Some(attachment)),
             private: private.clone(),
             registration: plan.instance.registration(),
             subnets,
+            routing,
             mode,
             policy: Mutex::new(None),
             links: Mutex::new(private.run(LinkEvents::open)?),
@@ -66,7 +68,7 @@ impl Bridge {
         let contents = std::fs::read(self.registration.join("conf.json")).ok();
         let mut next = nat::Policy::read(self.mode, contents.as_deref(), current.as_ref());
         next.verify_addresses(&link.addresses);
-        self.private.run(|| link.reconcile())?;
+        self.private.run(|| link.reconcile(&self.routing))?;
         self.attachment
             .lock()
             .unwrap()

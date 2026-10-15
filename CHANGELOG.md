@@ -4,6 +4,10 @@ Changes are listed here using [Keep a Changelog](https://keepachangelog.com/en/1
 
 ## Unreleased
 
+### Fixed
+
+- Bridge return routing takes the local rule's priority and is installed before WARP starts, ahead of the policy WARP adds. Equal priorities apply in insertion order and the kernel gives WARP's priority-less rule the same priority, so the order survives reconnects. 0.1.3 placed it at the first free priority, so WARP's rule landed before it and tunnel verification failed with "no bridge return-rule priority between local lookup and other policies". Another policy ahead of that position now stops the instance with an explicit error.
+
 ## 0.1.3
 
 ### Changed

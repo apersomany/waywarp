@@ -122,7 +122,7 @@ The bridge is also reconciled during tunnel verification, when `conf.json` chang
 
 Each update takes one snapshot of WARP's link and applies the derived changes under one lock:
 
-- Restore the host-to-WARP route. The return route and rule use an interface name rather than WARP's link index, so they are installed once.
+- Restore the host-to-WARP route. The return route and rule use an interface name rather than WARP's link index, so they are installed once. The return rule takes the local rule's priority, right after local delivery and before WARP starts. WARP adds its policy without a priority and the kernel gives it the same one, after ours, so the order holds however often WARP recreates it. A foreign policy already ahead of that position stops the instance rather than being moved.
 - Set WARP's MTU on both ends of the veth pair. This lets the host report oversized packets itself; errors generated inside the namespace could follow WARP's routes away from the host. The firewall also clamps TCP MSS in both directions.
 - Read the NAT mode and `conf.json`, verify the assigned addresses against the link, and replace changed NAT rules in one nftables transaction.
 

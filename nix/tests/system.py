@@ -72,6 +72,14 @@ def warp_managed_routes() -> None:
         )
 
 
+def return_priorities() -> list[int]:
+    priorities = []
+    for family in ["-4", "-6"]:
+        rules = json.loads(machine.succeed(TOKYO_NAMESPACE + f"ip -j -N {family} rule show"))
+        priorities += [rule["priority"] for rule in rules if rule.get("iif") == "CloudflareWARP"]
+    return priorities
+
+
 def assert_bridge_return_routes() -> None:
     for family, destination, source in [
         ("-4", "100.96.0.42", "203.0.113.1"),
@@ -82,7 +90,8 @@ def assert_bridge_return_routes() -> None:
         local = next(rule for rule in rules if int(rule.get("table", 0)) == 255)
         returning = next(rule for rule in rules if rule.get("iif") == "CloudflareWARP")
         managed = next(rule for rule in rules if int(rule.get("table", 0)) == 65743)
-        assert local["priority"] < returning["priority"] < managed["priority"], rules
+        # Equal priorities apply in the order listed.
+        assert rules.index(local) < rules.index(returning) < rules.index(managed), rules
         route = json.loads(machine.succeed(
             TOKYO_NAMESPACE
             + f"ip -j {family} route get {destination} from {source} iif CloudflareWARP"
@@ -247,22 +256,18 @@ def check_bridge_reconciliation() -> None:
             'waywarp status tokyo --json | grep -F \'"state":"connected"\'', timeout=45
         )
 
-    with subtest("return routing does not assume WARP's priority is 99"):
-        for family in ["-4", "-6"]:
-            machine.succeed(
-                TOKYO_NAMESPACE
-                + f"ip {family} rule del pref 99 not fwmark 0x100cf lookup 65743; "
-                + TOKYO_NAMESPACE
-                + f"ip {family} rule add pref 42 not fwmark 0x100cf lookup 65743"
-            )
-        assert_bridge_return_routes()
-        for family in ["-4", "-6"]:
-            machine.succeed(
-                TOKYO_NAMESPACE
-                + f"ip {family} rule del pref 42 not fwmark 0x100cf lookup 65743; "
-                + TOKYO_NAMESPACE
-                + f"ip {family} rule add pref 99 not fwmark 0x100cf lookup 65743"
-            )
+    with subtest("return routing stays ahead of WARP's rule across rapid reconnects"):
+        for _ in range(5):
+            # The stub deletes and re-adds its rule with no priority, so nothing can intervene.
+            machine.succeed("waywarp warp-cli tokyo connect")
+            machine.succeed("waywarp warp-cli tokyo connect")
+            for family in ["-4", "-6"]:
+                assert_warp_route(family)
+            assert_bridge_return_routes()
+            assert return_priorities() == [0, 0]
+        machine.wait_until_succeeds(
+            'waywarp status tokyo --json | grep -F \'"state":"connected"\'', timeout=45
+        )
 
     with subtest("bridge sizes the link to WARP and clamps TCP"):
         machine.succeed("ip -o link show waywarp2 | grep -F 'mtu 1280'")

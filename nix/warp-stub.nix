@@ -10,10 +10,11 @@
 # instance's daemon directory, and warp-svc serves its socket and a proxy port that answers "stub".
 let
   policy = ''
-    # Include reply destinations that expose conflicts with Waywarp's return policy.
+    # Like warp-svc, request no priority and let the kernel choose it. Include reply destinations
+    # that expose conflicts with Waywarp's return policy.
     for family in -4 -6; do
-      ip "$family" rule del pref 99 not fwmark 0x100cf lookup 65743 2>/dev/null || true
-      ip "$family" rule add pref 99 not fwmark 0x100cf lookup 65743
+      while ip "$family" rule del not fwmark 0x100cf lookup 65743 2>/dev/null; do :; done
+      ip "$family" rule add not fwmark 0x100cf lookup 65743
     done
     ip -4 route replace 100.96.0.0/12 dev CloudflareWARP table 65743
     ip -6 route replace 2606:4700:cf1:1000::/64 dev CloudflareWARP table 65743

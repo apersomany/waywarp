@@ -1,43 +1,18 @@
 # Architecture
 
-Waywarp runs the official WARP client inside private namespaces and controls how it reaches the network. This document covers the implementation; start with the [README](../README.md) for usage.
-
-## Terms
-
-| Term | Meaning |
-| --- | --- |
-| instance | One WARP client, keyed by an index from `0` to `255`, with an optional name |
-| selector | An index or name accepted by a command |
-| access | How the host uses an instance: `proxy` or `bridge` |
-| interface | The host network interface used for outgoing tunnel and direct control traffic |
-| via | One `--via` entry: direct, a SOCKS5 relay, or a Mudfish filter |
-| route | A concrete connection path expanded from a via: direct or one relay |
-| relay | A SOCKS5 server used during connection setup |
-| bootstrap | Trying connection paths until WARP meets the location requirements |
-| migrate | Moving outer UDP flows from the relay to direct sockets |
-| ping | Testing a relay before asking WARP to connect through it |
-| locations | The observed fields checked by `--location` |
-| supervisor | The process that owns and runs an instance |
+Waywarp runs the official WARP client inside private namespaces and forwards its network traffic through host sockets. For usage, start with the [README](../README.md); this page is a map of the implementation.
 
 ## Processes and locks
 
-`waywarp up` validates its options and locks the instance. If there is no saved registration, it requires `--accept-tos` before proceeding with setup. The consent flag is passed to the supervisor and checked again before starting the registration daemon. In proxy mode, it binds the host listener before starting setup so an address conflict fails early.
+Each instance has a supervisor that owns its daemon, data plane, and optional bridge. `up` validates options, checks registration consent, and takes an exclusive instance lock. Proxy mode binds its host listener before setup so address conflicts fail early. `import` takes the same lock and cannot modify a running or starting instance.
 
-By default, `up` starts a detached supervisor in a new session using the hidden `__supervise` command. It sends the setup plan over a `SOCK_SEQPACKET` socket pair, along with the open lock and proxy listener descriptors. The supervisor reports progress and the final result over the same channel. If the caller exits or is interrupted before setup finishes, the supervisor exits too, and the kernel releases its resources.
+By default, `up` starts a detached supervisor in a new session. A `SOCK_SEQPACKET` socket pair carries the setup plan, lock and listener descriptors, progress, and the final result. If the caller disappears before setup completes, the supervisor stops. After setup, a runtime control socket serves `status`, `warp-cli`, and `down`.
 
-With `--foreground`, the command runs the supervisor itself. It logs to stderr and sends systemd a readiness notification after the connection and location checks succeed.
-
-Once setup is complete, a control socket in the runtime directory serves `status`, `warp-cli`, and `down`.
-
-The instance lock is an exclusive `flock`. It stays held through the open descriptor passed to the supervisor, until the instance stops. Both `up` and `import` take this lock before changing state, so they cannot modify a running or starting instance.
-
-Indices are primary keys. Names are aliases saved in a `name` file under each instance's state directory. A store-wide lock prevents two instances from being assigned the same name.
+With `--foreground`, the caller runs the supervisor itself and signals systemd readiness after connection and location checks pass. The instance lock stays held until shutdown. A separate store-wide lock protects name assignments.
 
 ## Isolation
 
-The supervisor creates its mount namespace before starting threads. For a normal user, it first creates a user namespace that maps the caller to root inside it.
-
-Bind mounts give `warp-svc` its own state, logs, sockets, and DNS configuration:
+The supervisor creates its mount namespace before starting threads. Rootless runs first create a user namespace mapping the caller to root inside it. Bind mounts give WARP private paths:
 
 | WARP path | Instance path |
 | --- | --- |
@@ -46,113 +21,55 @@ Bind mounts give `warp-svc` its own state, logs, sockets, and DNS configuration:
 | `/run/cloudflare-warp` | `RUNTIME/INDEX/daemon` |
 | `/etc/resolv.conf` | `RUNTIME/INDEX/resolv.conf` |
 
-WARP calls `/usr/sbin/ip` and `/usr/sbin/nft` by absolute path. If those paths are missing, as on NixOS, an overlay on `/usr` supplies the tools from `PATH` without hiding the rest of `/usr`.
+An empty tmpfs hides `/run/nscd` so DNS lookups cannot escape through the host's resolver. Where WARP's absolute `/usr/sbin/ip` and `/usr/sbin/nft` paths are missing, an overlay on `/usr` supplies them from `PATH`.
 
-An empty tmpfs hides `/run/nscd`. Otherwise, glibc can ask the host's nscd to resolve names on WARP's behalf. Those lookups would use the host network rather than the DNS proxy in the private `resolv.conf`.
-
-The running daemon has its own network namespace. Before WARP connects, its only default route leads to a supervisor-owned TUN device. Waywarp decides which traffic from that device can leave the namespace.
-
-Initial device registration needs TCP, so it uses a temporary daemon on the host network. That daemon has its capabilities stripped to keep it from changing host routes or firewall state. It uses the instance's private state and is stopped before the regular daemon starts.
-
-Helper processes receive a parent-death signal if their owning thread dies. They also unblock the termination signals reserved for the supervisor's signal-handling thread.
+The running daemon has its own network namespace, with a supervisor-owned TUN as its physical uplink. Initial registration needs TCP, so a temporary daemon runs on the host network with capabilities stripped to prevent host route or firewall changes. It uses the private state and stops before the regular daemon starts. Helper processes receive a parent-death signal if their owning thread dies.
 
 ## Data plane
 
-One event loop per instance handles UDP forwarding and TCP connections between the private namespace and host sockets.
+One event loop per instance handles UDP forwarding and TCP connections between the namespace and host sockets.
 
-### Tunnel UDP
+- **Tunnel UDP:** each flow gets a socket bound to the selected physical interface. During relay setup, only traffic to the configured WARP edge uses SOCKS5; other underlay UDP, including DNS, stays direct. Migration switches tunnel flows to direct sockets and closes relay associations. Only a reply from the configured edge confirms migration. New flows are blocked between connection attempts to prevent an unintended path.
+- **Team control TCP:** namespace-local nftables redirects locally originated IPv4 TCP routed through the emulated uplink to a listener. The event loop reads `SO_ORIGINAL_DST` and forwards through a host socket bound to the selected interface. Traffic routed through `CloudflareWARP` stays in the tunnel, including connector control traffic.
+- **Proxy access:** a host listener forwards connections to WARP's namespace-local proxy port using userspace buffers.
+- **Bridge access:** an IPv4/IPv6 veth pair links the host and namespace. Namespace-local firewall and NAT rules handle both directions; Waywarp installs no host nftables rules. See [bridge access](access.md) for the user-facing policy.
 
-UDP packets from `warp-svc` arrive on the supervisor's TUN. Each flow gets a host socket bound to the chosen interface. With automatic selection, Waywarp resolves a physical interface through host routing for each new flow. Binding to that interface keeps tunnel traffic out of host VPNs. `--interface` fixes the choice instead.
+Bridge routing allocates unused namespace table IDs. Ingress rules keep return traffic ahead of WARP-managed routes but after local delivery, preserving connector services. The return rule takes the local rule's priority and is installed before WARP starts, so it stays ahead of the policy WARP adds at the same priority however often WARP recreates it; a foreign policy already ahead of that position stops the instance rather than being moved. Host-to-WARP fallback comes after WARP's policies and before the namespace's physical uplink. These rules do not alter locally originated WARP control traffic.
 
-During relay setup, UDP sent to the configured WARP edge uses SOCKS5 associations. Other underlay UDP, including DNS queries needed to validate proxy mode, stays direct. Relaying those queries would give every DNS flow a separately paced Mudfish login and stall validation.
+## Bootstrap and verification
 
-After a successful connection, migration switches the tunnel flows to their direct sockets and closes the relay associations. Only a reply from the configured WARP edge confirms migration; an unrelated DNS reply does not.
+Setup expands ordered `--via` entries only when reached. Each entry yields a direct path or concrete relays; later providers are not queried after an earlier success.
 
-New flows are blocked before a connection path is selected and between attempts. WARP therefore cannot make a new UDP connection over an unintended path.
+1. Relays are pinged four at a time using QUIC version negotiation for UDP reachability and RTT, plus a trace request for a colo hint. Unlikely colos are tried last, not discarded.
+2. Each attempt starts from a confirmed disconnect. The first relay association is authenticated before WARP connects, keeping Mudfish's pacing delay outside WARP's handshake deadline. Later associations use bounded FIFO queues for pending datagrams.
+3. After a relayed connection succeeds, the data plane switches to direct sockets. WARP may migrate its QUIC session or reconnect; either way, the supervisor waits for a stable connection.
+4. The supervisor reconciles the bridge, probes locations, and checks every requirement. Verification must stay on the same tunnel generation through probing and a quiet interval. After migration or an observed QUIC handshake, at least one tunnel probe must succeed.
 
-### Direct TCP for Team registrations
+A persistent `warp-cli --listen status` process reports connection changes. The data plane also observes QUIC handshakes without decrypting traffic. Handshake activity, path changes, CLI events, and bridge link changes invalidate verification, even if WARP still reports connected or reuses a connection-ID routing prefix.
 
-Team registrations also need direct TCP for policy refreshes, posture requests, DNS-over-HTTPS, and connectivity checks.
+A background worker verifies pending generations. Until a current result is published, a connected tunnel is degraded rather than inheriting earlier healthy status. A location mismatch repeats bootstrap unless disabled. See [regions and relays](regions.md) for migration behavior and the store-wide Mudfish authentication limit.
 
-An nftables output redirect catches locally originated IPv4 TCP routed through the emulated physical uplink, `tun`, and sends it to a listener inside the namespace. The event loop reads `SO_ORIGINAL_DST`, opens a host socket bound to the chosen interface, and copies data between the streams.
+## Bridge updates and cleanup
 
-TCP routed through `CloudflareWARP` is left alone. Sending it directly would bypass the tunnel, including for connector control traffic. Consumer registrations use the UDP-only underlay path.
+Kernel link/address notifications, `conf.json` changes, tunnel verification, and a five-second fallback trigger bridge reconciliation. Lost or malformed link events force a fresh snapshot. Each update takes one WARP link snapshot under a lock, repairs policy rules and routes, copies its MTU to the veth pair, and atomically replaces changed NAT rules. TCP MSS is clamped in both directions.
 
-### Host access
+Translation targets are verified against WARP's current link. Invalid configuration removes routed-source exceptions; traffic needing translation is blocked for a family without a valid target. Existing conntrack mappings are not flushed. Transient update races are retried; persistent reconciliation errors stop the instance.
 
-Proxy mode accepts connections on the host listener and forwards them to WARP's proxy port inside the namespace. TCP forwarding uses userspace buffers, not the kernel's `splice(2)` syscall.
+The bridge attachment removes its host link and policy rules on drop, including setup failures. Kernel namespace resources disappear when the supervisor exits. An instance stops if its daemon exits or data plane fails; restart policy belongs to the service manager.
 
-Bridge mode connects the host and namespace with an IPv4/IPv6 veth pair. Namespace-local nftables permits both directions. Source NAT uses the assigned device addresses, except for sources the configured policy leaves untranslated. Incoming traffic for those device addresses maps to the host-side link addresses.
-
-Separate IPv4 and IPv6 policy tables route traffic from the host into WARP and traffic from WARP back to the host. No host nftables rules are installed. See [bridge access](access.md) for the routing and NAT policy.
-
-## Relay authentication
-
-All Mudfish SOCKS5 handshakes in a store share an authentication limiter. This includes relay pings, colo traces, and tunnel flows.
-
-A locked, owner-only file in the runtime directory ensures exchanges do not overlap and leaves at least six seconds between them, including failures. It holds only a boot-time monotonic timestamp, not credentials or account identifiers. The timestamp survives supervisor restarts. Its path is resolved before entering a rootless user namespace.
-
-Other users' stores and external programs do not share this limit. Ordinary `socks5:` entries are not paced.
-
-## Bootstrap
-
-Each setup expands the ordered `--via` entries only as they are reached. Later providers are not contacted if an earlier entry succeeds; Mudfish node lists are fetched afresh when needed.
-
-1. Relays within the current entry are pinged four at a time. A QUIC version negotiation packet tests UDP reachability and measures the reply time. A separate trace request gives a colo hint. Relays that look unlikely to meet the requirements are tried last, not discarded: the hint may be wrong.
-2. Each connection attempt starts from a confirmed disconnect. The UDP routing state is blocked, direct, or relayed, so an earlier connection cannot carry over into the next attempt.
-3. For a relay, the supervisor authenticates the first UDP association on the host before starting WARP and hands it to the event loop. This keeps Mudfish's pacing delay outside WARP's short Happy Eyeballs deadline. Later flows waiting for an association retain up to 32 datagrams and 64 KiB in FIFO order. Overflow drops new arrivals rather than replacing the initial QUIC packets.
-4. After WARP connects through a relay, Waywarp switches its UDP flows to direct sockets. WARP may migrate the existing QUIC session or reconnect while the new path settles. The supervisor waits for a connection if that happens.
-5. The supervisor reconciles any bridge and reads locations inside the namespace, then checks every requirement. Verification is tied to the current tunnel generation and retried if it changes during a probe. After migration, or when a QUIC session has been observed, at least one tunnel probe must succeed. A location mismatch moves on to the next connection path.
-
-The observations behind location retention are described separately in [WARP routing observations](routing.md).
-
-## Monitoring and cleanup
-
-A persistent `warp-cli --listen status` process reports connection changes. Connection waits use those events rather than polling. Daemon startup is polled because `warp-svc` does not announce when its control socket opens.
-
-The data plane also observes WARP's QUIC handshakes without decrypting tunnel traffic. New connection attempts and handshake exchanges invalidate prior verification, even when `warp-cli` remains connected or the routing prefix of a connection ID is reused. Path changes, CLI status events, and bridge link events contribute to the same generation.
-
-A background worker rechecks pending generations. Location results are published only when the connection stays healthy and the generation remains unchanged through probing and a quiet interval. A connected tunnel with stale verification is reported as degraded until a current result is published; it cannot inherit healthy status from an earlier connection. If a required field no longer matches and rebootstrap is enabled, the worker repeats setup.
-
-### Bridge updates
-
-WARP recreates its link on connection, and the kernel removes routes through the old link. The supervisor subscribes to kernel link and IPv4/IPv6 address notifications before starting the daemon. These events trigger bridge reconciliation and fresh tunnel verification even without a CLI reconnect. Lost or malformed event data invalidates the tracked link and forces a fresh snapshot.
-
-The bridge is also reconciled during tunnel verification, when `conf.json` changes, and every five seconds as a fallback. Transient snapshot/update races are retried; persistent reconciliation errors stop the instance.
-
-Each update takes one snapshot of WARP's link and applies the derived changes under one lock:
-
-- Restore the host-to-WARP route. The return route and rule use an interface name rather than WARP's link index, so they are installed once. The return rule takes the local rule's priority, right after local delivery and before WARP starts. WARP adds its policy without a priority and the kernel gives it the same one, after ours, so the order holds however often WARP recreates it. A foreign policy already ahead of that position stops the instance rather than being moved.
-- Set WARP's MTU on both ends of the veth pair. This lets the host report oversized packets itself; errors generated inside the namespace could follow WARP's routes away from the host. The firewall also clamps TCP MSS in both directions.
-- Read the NAT mode and `conf.json`, verify the assigned addresses against the link, and replace changed NAT rules in one nftables transaction.
-
-In `auto` mode, advertised connector source subnets are left untranslated when `nat_mode` is false. Other sources are translated to `interface.v4` or `interface.v6`. Inbound DNAT matches only these assigned addresses, leaving shared connector addresses such as mesh DNS inside the namespace.
-
-Translation targets must be on WARP's current link. Traffic needing translation is blocked for a family without a valid target. Invalid configuration removes the untranslated-source exceptions and uses the last verified targets, checked against the current link. The directory watch catches atomic replacement of `conf.json`. Conntrack is not flushed, and registration contents are never logged.
-
-### Shutdown
-
-The host link and policy rules belong to an attachment that removes them on drop, including if setup fails later. The kernel also releases namespace resources when the supervisor exits.
-
-An instance stops if `warp-svc` exits or the data plane fails. It does not restart itself; a service manager can restart it.
-
-## Source layout
+## Source map
 
 | Module | Responsibility |
 | --- | --- |
-| `cli` | Command-line interface |
-| `client` | Starting instances and sending control requests |
-| `store` | State and runtime directories, names, selectors, and locks |
-| `supervise` | Instance lifecycle, bootstrap, bridge updates, and control socket |
-| `warp` | `warp-cli` commands, daemon management, and status monitoring |
-| `dataplane` | Event loop, UDP flows, TCP forwarding, packet framing, and QUIC generation tracking |
-| `via` | Connection paths, interfaces, SOCKS5, Mudfish, and relay pings |
-| `location` | Location requirements, geofeed data, and probes |
-| `sandbox` | Mount and network namespaces, TUN, and TCP redirect |
-| `bridge` | Host link, subnets, firewall, routes, kernel link/address notifications, link snapshots, and NAT |
-| `http` | HTTP requests with SOCKS5 and pinned addresses |
-| `tool` | Running `ip`, `nft`, and other helpers |
-| `notify` | systemd readiness notification |
-| `output` | Human status and errors, stdout writes, color and escaping, and tracing console/log formatting |
-| `text` | Text normalization for filters and places |
-| `ipc`, `protocol` | Messages and descriptor passing between client and supervisor |
+| [`cli`](../src/cli.rs), [`client`](../src/client.rs) | CLI validation, startup, and control requests |
+| [`store`](../src/store.rs) | State/runtime paths, selectors, names, imports, and locks |
+| [`supervise`](../src/supervise/mod.rs) | Lifecycle, bootstrap, verification, and bridge updates |
+| [`warp`](../src/warp/mod.rs) | Daemon management, native commands, and status monitoring |
+| [`sandbox`](../src/sandbox.rs) | Namespaces, bind mounts, TUN, and TCP redirect |
+| [`dataplane`](../src/dataplane/mod.rs) | UDP/TCP forwarding and QUIC generation tracking |
+| [`bridge`](../src/bridge.rs) | Links, routing, MTU, NAT, and kernel notifications |
+| [`via`](../src/via/mod.rs) | Interfaces, SOCKS5, Mudfish, relay pings, and authentication pacing |
+| [`location`](../src/location/mod.rs), [`http`](../src/http.rs) | Requirements, cached location data, and probes |
+| [`output`](../src/output.rs) | Human results, diagnostics, stream handling, and tracing formatting |
+| [`ipc`](../src/ipc.rs), [`protocol`](../src/protocol.rs) | Messages, structured progress/failures, and descriptor passing |
+| [`tool`](../src/tool.rs), [`notify`](../src/notify.rs), [`text`](../src/text.rs) | Helper execution, systemd notifications, and text normalization |

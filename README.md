@@ -137,13 +137,11 @@ See [location fields](docs/locations.md) for matching rules and further details.
 
 # Documentation
 
-- [Instances, logs, and troubleshooting](docs/instances.md)
+- [Instances, status, logs, and troubleshooting](docs/instances.md)
 - [Bridge routing, NAT, and Zero Trust](docs/access.md)
-- [Regional bootstrapping, filters, and credentials](docs/regions.md)
-- [Location fields](docs/locations.md)
+- [Regional setup, relay filters, and credentials](docs/regions.md)
+- [Location fields and matching rules](docs/locations.md)
 - [NixOS services](docs/nixos.md)
-- [Terminal output and stream contracts](docs/terminal-output.md)
-- [WARP routing observations](docs/routing.md)
 - [Architecture](docs/architecture.md)
 - [Changelog](CHANGELOG.md)
 

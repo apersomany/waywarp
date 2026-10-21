@@ -29,20 +29,16 @@ Add `waywarp.url = "github:apersomany/waywarp";` to your flake inputs. Pass `inp
 
 `acceptTos = true` accepts [Cloudflare's WARP Terms of Service](https://www.cloudflare.com/application/terms/) for a new registration. Review them before enabling it. The default is `false`; saved and imported registrations can start without it.
 
-This creates `waywarp-home.service` and `waywarp-hong-kong.service` and installs the `waywarp` command. Use `sudo` to inspect these root-owned instances:
+The module installs `waywarp` and creates `waywarp-home.service` and `waywarp-hong-kong.service`. It neither starts nor requires the host's `cloudflare-warp` service. Inspect these root-owned instances with `sudo`:
 
 ```sh
 sudo waywarp status hong-kong
 journalctl -u waywarp-hong-kong
 ```
 
-The module does not start the host's `cloudflare-warp` service, and does not need it to be running.
-
 ## Options
 
-Each entry in `services.waywarp.instances` defines one service. Its attribute name becomes the instance's name and must follow the [instance naming rules](instances.md#names-and-lifecycle).
-
-The `index` remains the instance's primary key. Changing an attribute name while keeping the index reuses that instance's registration. Changing the index selects a different instance. Every configured instance needs a unique index.
+Each `services.waywarp.instances` entry defines a service. Its attribute name becomes the instance's name and must follow the [naming rules](instances.md#names-and-lifecycle). Indices must be unique; renaming an entry preserves its registration if the index stays the same.
 
 | Option | Meaning |
 | --- | --- |
@@ -63,25 +59,21 @@ Choose exactly one of `access.proxy` or `access.bridge`. An empty set, such as `
 
 ### Credentials
 
-`environmentFile` must point outside the Nix store. A file supplied by a secret manager at boot is a suitable choice. It contains lines such as:
+Use a root-readable file outside the Nix store, such as one supplied by a secret manager at boot. It contains lines such as:
 
 ```text
 WAYWARP_MUDFISH_USERNAME=...
 WAYWARP_MUDFISH_PASSWORD=...
 ```
 
-The file must be readable by the root-owned service. Do not put relay passwords in the Nix configuration or store.
+Do not put relay passwords in the Nix configuration or store.
 
 ### Package
 
-`services.waywarp.package` selects the package. By default, it uses the flake's own nixpkgs and permits the unfree headless WARP package for that build only.
-
-If you supply a package built from your own nixpkgs, your unfree policy must allow `cloudflare-warp-headless`.
+`services.waywarp.package` defaults to the flake's package, built with its own nixpkgs and permission for the unfree headless WARP dependency. If you build a replacement from your own nixpkgs, allow `cloudflare-warp-headless` in your unfree policy.
 
 ## Service behavior
 
-Each service runs the selected access mode with `--foreground`. For example, the proxy service above runs `waywarp up proxy 0 --name home --foreground --accept-tos`.
+Services run with `--foreground` and report ready after connection and location checks pass, so other units can order themselves after them. Logs go to the journal.
 
-The service reports ready once WARP is connected and its required locations match. Other units can order themselves after it. Logs go to the journal.
-
-Runtime failures restart the service after five seconds. Invalid command-line options or missing consent for a new registration exit with code `2`, which the module does not retry. The start timeout is ten minutes, allowing time for paced relay searches; the stop timeout is thirty seconds.
+Runtime failures restart after five seconds. Invalid options or missing registration consent exit `2` and are not retried. The start timeout is ten minutes for paced relay searches; the stop timeout is thirty seconds.

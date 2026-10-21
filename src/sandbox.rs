@@ -82,11 +82,10 @@ pub fn isolate(instance: &Instance) -> Result<()> {
         (instance.registration(), "/var/lib/cloudflare-warp"),
         (instance.warp_logs(), "/var/log/cloudflare-warp"),
         (instance.daemon_socket(), "/run/cloudflare-warp"),
-        (instance.resolv_conf(), "/etc/resolv.conf"),
     ];
     // Bind mounts need their targets; WARP's own directories exist once its package or service
     // has run, and root can create them without disturbing anything.
-    for (_, target) in &mounts[..3] {
+    for (_, target) in &mounts {
         let target = Path::new(target);
         if !target.exists() {
             if !Uid::effective().is_root() {
@@ -118,8 +117,54 @@ pub fn isolate(instance: &Instance) -> Result<()> {
     for (source, target) in mounts {
         bind(&source, Path::new(target))?;
     }
+    private_etc(instance)?;
     hide_nscd()?;
     provide_sbin(instance)
+}
+
+// Resolvers that answer until warp-svc writes its own resolv.conf.
+const SEED_RESOLV_CONF: &str = "nameserver 1.1.1.1\nnameserver 1.0.0.1\n";
+
+// warp-svc rewrites /etc/resolv.conf to name its own DNS proxy and restores the previous file when
+// it stops, replacing the directory entry rather than its content, so /etc itself must be private.
+// A bind mount over the file cannot do that: mount(2) follows a symlinked /etc/resolv.conf and
+// covers its target instead of the entry, while a covered entry becomes a mountpoint that refuses
+// warp-svc's renames with EBUSY. Either way the first rename that lands on an uncovered entry
+// rewrites the host's /etc, whose directory every instance shares. A copy-on-write /etc gives
+// warp-svc a plain file it can replace as often as it likes, and the host's resolv.conf, whether a
+// regular file or a symlink such as systemd-resolved's, is never a path warp-svc can reach.
+fn private_etc(instance: &Instance) -> Result<()> {
+    // The upper layer is a fresh tmpfs: nothing survives a run, and rootless instances keep every
+    // whiteout and xattr the overlay needs inside their own user namespace.
+    let scratch = instance.runtime().join("etc");
+    fs::create_dir_all(&scratch)?;
+    mount(
+        Some("tmpfs"),
+        &scratch,
+        Some("tmpfs"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+        Some("mode=0700"),
+    )
+    .context("mounting the private /etc layer")?;
+    let upper = scratch.join("upper");
+    let work = scratch.join("work");
+    fs::create_dir_all(&upper)?;
+    fs::create_dir_all(&work)?;
+    // Written before the overlay mounts so the regular file shadows a host symlink at the path.
+    fs::write(upper.join("resolv.conf"), SEED_RESOLV_CONF)?;
+    let options = format!(
+        "lowerdir=/etc,upperdir={},workdir={}",
+        upper.display(),
+        work.display()
+    );
+    mount(
+        Some("overlay"),
+        "/etc",
+        Some("overlay"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+        Some(options.as_str()),
+    )
+    .context("giving the instance a private /etc")
 }
 
 // glibc hands name lookups to a running nscd, which resolves them in the host's network

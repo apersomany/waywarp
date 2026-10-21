@@ -7,6 +7,7 @@ Changes are listed here using [Keep a Changelog](https://keepachangelog.com/en/1
 ### Fixed
 
 - Bridge return routing takes the local rule's priority and is installed before WARP starts, ahead of the policy WARP adds. Equal priorities apply in insertion order and the kernel gives WARP's priority-less rule the same priority, so the order survives reconnects. 0.1.3 placed it at the first free priority, so WARP's rule landed before it and tunnel verification failed with "no bridge return-rule priority between local lookup and other policies". Another policy ahead of that position now stops the instance with an explicit error.
+- WARP's `resolv.conf` takeover and restore stay inside the instance. A private copy-on-write `/etc` replaces the bind mount over `/etc/resolv.conf`, which followed a host symlink onto its target and let WARP's renames rewrite the host's file ([#2](https://github.com/apersomany/waywarp/issues/2)).
 
 ## 0.1.3
 

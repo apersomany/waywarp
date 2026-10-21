@@ -28,7 +28,19 @@ let
     ];
     text = ''
       # Behaves like one process: stopping it stops every listener it started.
-      trap 'kill 0' EXIT
+      restore_resolv_conf() {
+        if [ -e /etc/resolv.conf.warp-backup ] || [ -L /etc/resolv.conf.warp-backup ]; then
+          rm -f /etc/resolv.conf
+          mv /etc/resolv.conf.warp-backup /etc/resolv.conf
+        fi
+      }
+      trap 'restore_resolv_conf; kill 0' EXIT
+      # Like warp-svc, take over name resolution by renaming the current resolv.conf aside and
+      # restoring it on exit. Both renames replace the directory entry, not just the file's content.
+      if [ -e /etc/resolv.conf ] || [ -L /etc/resolv.conf ]; then
+        mv /etc/resolv.conf /etc/resolv.conf.warp-backup 2>/dev/null || true
+      fi
+      printf 'nameserver 127.0.2.2\nnameserver 127.0.2.3\n' > /etc/resolv.conf
       # Bridge access routes into the link warp-svc creates in warp mode, whose MTU is smaller
       # than the host link's.
       if ip link add CloudflareWARP mtu 1280 type dummy 2>/dev/null; then

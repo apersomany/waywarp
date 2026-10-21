@@ -19,9 +19,8 @@ The supervisor creates its mount namespace before starting threads. Rootless run
 | `/var/lib/cloudflare-warp` | `STATE/INDEX/registration` |
 | `/var/log/cloudflare-warp` | `STATE/INDEX/logs` |
 | `/run/cloudflare-warp` | `RUNTIME/INDEX/daemon` |
-| `/etc/resolv.conf` | `RUNTIME/INDEX/resolv.conf` |
 
-An empty tmpfs hides `/run/nscd` so DNS lookups cannot escape through the host's resolver. Where WARP's absolute `/usr/sbin/ip` and `/usr/sbin/nft` paths are missing, an overlay on `/usr` supplies them from `PATH`.
+An empty tmpfs hides `/run/nscd` so DNS lookups cannot escape through the host's resolver. A copy-on-write overlay on `/etc`, with its upper layer on a private tmpfs, gives WARP a private `/etc/resolv.conf` it can rename over and restore without touching the host's entry, including when the host's is a symlink such as systemd-resolved's. Where WARP's absolute `/usr/sbin/ip` and `/usr/sbin/nft` paths are missing, an overlay on `/usr` supplies them from `PATH`.
 
 The running daemon has its own network namespace, with a supervisor-owned TUN as its physical uplink. Initial registration needs TCP, so a temporary daemon runs on the host network with capabilities stripped to prevent host route or firewall changes. It uses the private state and stops before the regular daemon starts. Helper processes receive a parent-death signal if their owning thread dies.
 

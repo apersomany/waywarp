@@ -265,10 +265,6 @@ impl Instance {
         self.runtime().join("daemon")
     }
 
-    pub fn resolv_conf(&self) -> PathBuf {
-        self.runtime().join("resolv.conf")
-    }
-
     pub fn name(&self) -> Result<Option<Name>> {
         let path = self.state().join("name");
         match fs::read_to_string(&path) {
@@ -441,10 +437,6 @@ impl Instance {
             fs::remove_dir_all(&daemon)?;
         }
         private_directory(&daemon)?;
-        fs::write(
-            self.resolv_conf(),
-            "nameserver 1.1.1.1\nnameserver 1.0.0.1\n",
-        )?;
         Ok(())
     }
 }

@@ -45,6 +45,15 @@ def physical_ipv4() -> str:
     return json.loads(machine.succeed("ip -j -4 route get 198.51.100.7"))[0]["prefsrc"]
 
 
+def resolv_conf_state() -> str:
+    # The directory entry itself: warp-svc replaces the file by renaming over it.
+    return machine.succeed(
+        "echo $(stat -c '%F %i' /etc/resolv.conf)"
+        " $(md5sum < /etc/resolv.conf | cut -d' ' -f1)"
+        " $(if [ -L /etc/resolv.conf ]; then readlink /etc/resolv.conf; fi)"
+    ).strip()
+
+
 def bridge_table(family: str, ingress: str) -> int:
     rules = json.loads(machine.succeed(TOKYO_NAMESPACE + f"ip -j -N {family} rule show"))
     matches = [rule for rule in rules if rule.get("iif") == ingress]
@@ -638,6 +647,37 @@ def check_isolation_and_cleanup() -> None:
         machine.succeed(
             TOKYO_NAMESPACE.replace(" -n ", " -n -m ") + "test ! -e /run/nscd/socket"
         )
+
+    with subtest("warp-svc's resolv.conf takeover and restore stay inside the instance"):
+        # warp-svc renames over /etc/resolv.conf to name its DNS proxy and restores the previous
+        # file when it stops. Neither rename may reach the host's /etc, whatever its resolv.conf is.
+        machine.succeed("cp -a /etc/resolv.conf /root/resolv.conf.host")
+        home = (
+            "nsenter -t $(pgrep -o -x warp-svc --cgroup /system.slice/waywarp-home.service) -m "
+        )
+        for setup in [
+            "echo host > /etc/resolv.conf",
+            "mkdir -p /run/systemd/resolve && echo stub > /run/systemd/resolve/stub-resolv.conf"
+            " && ln -s /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf",
+        ]:
+            machine.succeed("systemctl stop waywarp-home.service")
+            machine.succeed("rm -f /etc/resolv.conf && " + setup)
+            before = resolv_conf_state()
+            machine.succeed("systemctl start waywarp-home.service")
+            machine.wait_until_succeeds(
+                "systemctl is-active waywarp-home.service", timeout=30
+            )
+            # The takeover reached the instance's own file, and the host kept its entry.
+            machine.succeed(home + "grep -Fx 'nameserver 127.0.2.2' /etc/resolv.conf")
+            assert resolv_conf_state() == before
+            machine.fail("ls /etc/resolv.conf.warp-backup")
+            machine.succeed("systemctl stop waywarp-home.service")
+            # The restore on shutdown reached the instance's own file too.
+            assert resolv_conf_state() == before
+            machine.fail("ls /etc/resolv.conf.warp-backup")
+        machine.succeed("rm -f /etc/resolv.conf && mv /root/resolv.conf.host /etc/resolv.conf")
+        machine.succeed("systemctl start waywarp-home.service")
+        machine.wait_until_succeeds("systemctl is-active waywarp-home.service", timeout=30)
 
     with subtest("a bridge that fails to bootstrap removes what it created"):
         # Probes cannot reach Cloudflare here; failure occurs after link/firewall setup.
